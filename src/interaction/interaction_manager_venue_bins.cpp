@@ -457,7 +457,7 @@ void InteractionManager::resolveVenueTypeAndMatrix(
   // group at a physical venue is mixed with regular patrons, and the
   // encounter_type_id of the "first" person in the group is arbitrary
   // (depends on person order, which varies with rank count).
-  const bool is_virtual_encounter = actual_venue_id < 0;
+  const bool is_virtual_encounter = isVirtualVenue(actual_venue_id);
   if (is_virtual_encounter &&
       encounter_type_id < world_.encounter_type_names.size()) {
     venue_type_id_out = encounter_type_id;

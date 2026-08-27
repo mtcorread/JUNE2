@@ -34,7 +34,7 @@ double OutcomeRates::getRate(const Person& person, const WorldState* world,
 void OutcomeRates::resolve(const WorldState& world) {
   for (auto& row : rows) {
     for (auto& c : row.criteria) {
-      c.resolve(world);
+      c.resolveOrThrow(world, "disease outcome rates row");
     }
   }
 }

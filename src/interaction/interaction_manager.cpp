@@ -254,8 +254,8 @@ void InteractionManager::aggregateOneVenueGroupForParent(
     const std::unordered_map<PersonId, VisitorInfo>* visitor_data) {
   const auto& first = active_locations_buffer_[group_start];
 
-  // Virtual encounters (venue_id < 0) have no parent.
-  if (first.venue_id < 0) return;
+  // A group at no Venue has no parent Venue either.
+  if (occupiesNoVenue(first.venue_id)) return;
 
   Venue* venue = world_.getVenue(first.venue_id);
   if (!venue) return;
@@ -400,9 +400,11 @@ void InteractionManager::filterAndSortActiveLocations(
   std::sort(active_locations_buffer_.begin(), active_locations_buffer_.end(),
             [](const PersonLocation& a, const PersonLocation& b) {
               if (a.venue_id != b.venue_id) return a.venue_id < b.venue_id;
-              // Group by encounter_type_id ONLY for virtual venues (venue_id <
-              // 0)
-              if (a.venue_id < 0)
+              // Sub-sort by encounter_type_id only where there is no Venue.
+              // occupiesNoVenue, not isVirtualVenue: this comparator is
+              // reproducibility-critical, so it keeps its exact current
+              // semantics over the whole negative range.
+              if (occupiesNoVenue(a.venue_id))
                 return a.encounter_type_id < b.encounter_type_id;
               return false;
             });

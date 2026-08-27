@@ -44,7 +44,7 @@ int InteractionManager::processVenueTransmissions(
   const ContactMatrix* bin_structure = nullptr;
   resolveVenueTypeAndMatrix(venue, actual_venue_id, encounter_type_id,
                             venue_type, venue_type_id, bin_structure);
-  const bool is_virtual_encounter = actual_venue_id < 0;
+  const bool is_virtual_encounter = isVirtualVenue(actual_venue_id);
 
   // Null means the group was neither a physical venue nor a recognised
   // virtual encounter, so there is nothing to attribute contacts to. Taking
@@ -183,15 +183,12 @@ bool InteractionManager::processOneVenueSusceptible(
   double prob = 1.0 - std::exp(-total_risk * susc_mem.susceptibility);
   if (!(prob > 1e-12)) return false;
 
-  // Per-susceptible deterministic RNG for MPI reproducibility.
-  // For virtual venues (id <= -1000), extract the host's person_id
-  // so the RNG seed is deterministic regardless of which rank hosts
-  // the encounter.
+  // Per-susceptible deterministic RNG for MPI reproducibility. For a virtual
+  // venue, key on the host's person_id instead, so the seed is the same
+  // regardless of which rank hosts the encounter.
   uint64_t venue_key = static_cast<uint64_t>(actual_venue_id);
-  if (actual_venue_id <= -1000) {
-    // Virtual venue IDs encode the host's person_id: id = -1000 - pid.
-    venue_key =
-        static_cast<uint64_t>(-static_cast<int64_t>(actual_venue_id) - 1000);
+  if (isVirtualVenue(actual_venue_id)) {
+    venue_key = static_cast<uint64_t>(virtualVenueHost(actual_venue_id));
   }
   SplitMix64 susc_rng(
       mix_seed(base_seed_, susceptible_id, venue_key, time_bits));

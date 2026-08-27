@@ -549,6 +549,38 @@ TEST_CASE(
   CHECK(proposals.size() == 0);
 }
 
+TEST_CASE(
+    "1h. generateProposals — A physical venue typed as unresolvable throws") {
+  /**
+   * SCENARIO: A physical proposal carries the venue type every downstream
+   * participant reads, so manufacturing one whose type is unresolvable must
+   * fail loudly. Without the check, allowed_venue_mask only holds types below
+   * 32, so a 255 proposal is silently rejected later as a no-matching-def
+   * warning — indistinguishable from "the config does not allow this type".
+   *
+   * The reachable way to build one: a registry with the venue type at index
+   * 255, aliasing kUnknownVenueTypeId.
+   */
+  auto tw = buildEncounterWorld(
+      4, 1, "pub", "friendships", "social_encounters", false, "", {"leisure"},
+      InviteDistribution{DistributionType::FIXED, 1.0, 0.5, 1}, 1.0, 1.0);
+  addScheduleToAll(tw, "open", {{"all_day", {"leisure", "residence"}}});
+
+  // Move "pub" to registry index 255. The old entry is renamed so the venue
+  // type lookup cannot find it at index 2 instead.
+  auto& venue_type_names = tw.world.venue_type_names;
+  venue_type_names[2] = "unused_venue_type";
+  venue_type_names.resize(kUnknownVenueTypeId, "padding_venue_type");
+  venue_type_names.push_back("pub");
+  REQUIRE(venue_type_names.size() == 256);
+  tw.world.venues[0].type_id = kUnknownVenueTypeId;
+  tw.world.buildIndices();
+
+  CoordinatedEncounterManager cem(tw.world, tw.config, 0);
+  std::vector<EncounterProposal> proposals;
+  CHECK_THROWS_AS(cem.generateProposals(0, proposals, 0), std::runtime_error);
+}
+
 // =============================================================================
 // SECTION 2: Unit Tests — processProposals
 //
@@ -1389,8 +1421,9 @@ TEST_CASE(
 // SECTION 7: Policy Enforcement Tests
 //
 // In the simulator, after encounters are finalized, they are "injected" into
-// each participant's location for the relevant time slot. At injection time,
-// the simulator checks PolicyManager::getOverride() for each participant.
+// each participant's location for the relevant time slot. Eligibility asks
+// PolicyManager::suppressesParticipation() for each participant — the question
+// only, since pass 1 may still cancel the encounter.
 //
 // If a policy overrides the encounter's trigger activity (e.g., "leisure" →
 // "residence" due to symptom isolation), that participant is NOT injected
@@ -1406,13 +1439,14 @@ TEST_CASE(
 
 #include "epidemiology/disease.h"
 #include "epidemiology/policy.h"
+#include "simulation/encounters/eligibility.h"
 
 /**
- * Simulates the encounter injection loop from simulator.cpp (lines 376-420).
+ * Drives Simulator::injectCoordinatedEncountersIntoSlot without a Simulator.
  *
- * For each finalized encounter matching the given time_slot, it iterates
- * over participants and checks PolicyManager::getOverride(). If no policy
- * blocks the participant, their location is updated to the encounter venue.
+ * Pass 1 is the production seam (june::encounters::computeLocalEligibility);
+ * only the pass-2 injection stamp is reproduced here, minus the MPI-only
+ * global exchange and virtual-venue registration.
  *
  * @param encounters     Finalized encounters
  * @param time_slot      Which time slot to inject for
@@ -1431,80 +1465,21 @@ static std::set<PersonId> simulateEncounterInjection(
     const Config& config, PolicyManager* policy_manager, double current_time) {
   std::set<PersonId> injected;
 
-  // Build encounter_type_id -> trigger activity indices map
-  std::unordered_map<uint8_t, std::vector<int16_t>>
-      encounter_trigger_activities;
-  for (const auto& def : config.coordinated_encounters.encounters) {
-    int type_id = world.getEncounterTypeIndex(def.name);
-    if (type_id >= 0) {
-      std::vector<int16_t> indices;
-      for (const auto& slot_name : def.trigger_slots) {
-        int idx = world.getActivityIndex(slot_name);
-        if (idx >= 0) indices.push_back(static_cast<int16_t>(idx));
-      }
-      encounter_trigger_activities[static_cast<uint8_t>(type_id)] =
-          std::move(indices);
-    }
-  }
+  // Pass 1: the real production eligibility computation.
+  auto lookups = june::encounters::buildEncounterLookups(
+      world, config.coordinated_encounters.encounters);
+  auto slot_encounters = june::encounters::computeLocalEligibility(
+      encounters, time_slot, current_time, lookups, world, locations,
+      policy_manager);
 
-  // Build encounter_type_id -> min_attendees lookup
-  std::unordered_map<uint8_t, int> encounter_min_attendees;
-  for (const auto& def : config.coordinated_encounters.encounters) {
-    int type_id = world.getEncounterTypeIndex(def.name);
-    if (type_id >= 0) {
-      encounter_min_attendees[static_cast<uint8_t>(type_id)] =
-          def.min_attendees;
-    }
-  }
-
-  for (const auto& enc : encounters) {
-    if (enc.slot != time_slot) continue;
-
-    auto trig_it = encounter_trigger_activities.find(enc.encounter_type_id);
-
-    // Pass 1: Determine which participants are eligible (not policy-blocked)
-    std::vector<size_t> eligible_indices;
-    for (PersonId pid : enc.participants) {
-      auto it = world.person_index.find(pid);
-      if (it == world.person_index.end()) continue;
-
-      size_t array_idx = it->second;
-      if (array_idx >= locations.size()) continue;
-
-      Person& person = world.people[array_idx];
-      if (person.is_dead) continue;
-
-      // POLICY CHECK — mirrors simulator.cpp
-      bool policy_blocked = false;
-      if (policy_manager && trig_it != encounter_trigger_activities.end()) {
-        for (int16_t trigger_act_idx : trig_it->second) {
-          auto override = policy_manager->getOverride(
-              person, trigger_act_idx, locations[array_idx].venue_id,
-              locations[array_idx].subset_index, current_time, time_slot);
-          if (override.has_value()) {
-            policy_blocked = true;
-            break;
-          }
-        }
-      }
-      if (!policy_blocked) {
-        eligible_indices.push_back(array_idx);
-      }
-    }
-
-    // Pass 2: Only inject if enough participants survived policy checks
-    int min_required = 2;  // default
-    auto min_it = encounter_min_attendees.find(enc.encounter_type_id);
-    if (min_it != encounter_min_attendees.end()) {
-      min_required = min_it->second;
-    }
-
-    if (static_cast<int>(eligible_indices.size()) >= min_required) {
-      for (size_t array_idx : eligible_indices) {
-        locations[array_idx].venue_id = enc.venue_id;
-        locations[array_idx].encounter_type_id = enc.encounter_type_id;
-        injected.insert(world.people[array_idx].id);
-      }
+  // Pass 2: inject the encounters that met their threshold.
+  for (const auto& eligibility : slot_encounters) {
+    const auto& enc = encounters[eligibility.encounter_idx];
+    if (eligibility.local_eligible < eligibility.min_required) continue;
+    for (size_t array_idx : eligibility.eligible_indices) {
+      locations[array_idx].venue_id = enc.venue_id;
+      locations[array_idx].encounter_type_id = enc.encounter_type_id;
+      injected.insert(world.people[array_idx].id);
     }
   }
   return injected;
@@ -1592,8 +1567,8 @@ static void addLockdownPolicy(
     const std::vector<ActivityExemption>& exemptions = {}) {
   TemporalPolicy tp;
   tp.name = "test_lockdown";
-  tp.start_time = start_time;
-  tp.end_time = end_time;
+  tp.window.start_time = start_time;
+  tp.window.end_time = end_time;
 
   tp.action.override_all = true;
   tp.action.replacement_activity = "residence";
@@ -1604,6 +1579,37 @@ static void addLockdownPolicy(
 
   pm.addTemporalPolicy(tp);
   // Note: temporal policies don't need disease for resolve
+}
+
+/**
+ * Helper: Creates a TemporalPolicy overriding named activities to "residence",
+ * optionally restricted to a set of venue types (the Phase 1 restrict-to gate).
+ * Pass an empty venue_types for the activity-only behaviour that predates the
+ * gate. Resolving needs a Disease, so one is created and returned to the
+ * caller to keep alive.
+ */
+static std::unique_ptr<Disease> addVenueGatedPolicy(
+    PolicyManager& pm, WorldState& world,
+    const std::vector<std::string>& activities,
+    const std::vector<std::string>& venue_types, double start_time,
+    double end_time) {
+  TemporalPolicy tp;
+  tp.name = "close_pubs";
+  tp.window.start_time = start_time;
+  tp.window.end_time = end_time;
+
+  tp.action.override_activities.insert(activities.begin(), activities.end());
+  tp.action.override_venue_types.insert(venue_types.begin(),
+                                        venue_types.end());
+  tp.action.replacement_activity = "residence";
+  tp.action.replacement_activity_index =
+      static_cast<int16_t>(world.getActivityIndex("residence"));
+  tp.action.compliance_rate = 1.0;
+
+  pm.addTemporalPolicy(tp);
+  auto disease = createMinimalDisease({"healthy"});
+  pm.resolveAll(*disease);
+  return disease;
 }
 
 /**
@@ -2066,6 +2072,355 @@ TEST_CASE(
 
   REQUIRE(replies.size() == 1);
   CHECK(replies[0].status == ReplyStatus::REJECTED_NO_MATCHING_DEF);
+}
+
+// =============================================================================
+// SECTION 7g-7i: Venue-gated policies
+//
+// The gate must be asked about the venue the encounter would put the person
+// in, not the venue they are currently scheduled to. Everyone starts at home
+// (initLocations), so a gate read off locations[] never sees the pub.
+// =============================================================================
+
+TEST_CASE("7g. Venue gate — encounter at a gated pub is cancelled") {
+  /**
+   * SCENARIO:
+   *   close_pubs overrides "leisure" at venue type "pub" only.
+   *   The encounter is at pub venue 100; both participants are currently at
+   *   home. The gate must see "pub" and block both, cancelling the encounter.
+   *
+   * REGRESSION: reading locations[].venue_id here yields "home", the gate
+   * does not match, and injection puts both back in the closed pub.
+   */
+  auto tw = buildEncounterWorld(
+      2, 1, "pub", "friendships", "pub_meetups", false, "", {"leisure"},
+      InviteDistribution{DistributionType::FIXED, 1.0, 0.5, 1}, 1.0, 1.0);
+
+  PolicyManager pm(tw.world);
+  auto disease = addVenueGatedPolicy(pm, tw.world, {"leisure"}, {"pub"}, 0.0,
+                                     10.0);
+
+  tw.world.people[0].applicable_temporal_policy_mask = 1;
+  tw.world.people[1].applicable_temporal_policy_mask = 1;
+
+  CoordinatedEncounter enc;
+  enc.encounter_id = 700;
+  enc.host_id = 0;
+  enc.venue_id = 100;  // the pub
+  enc.venue_type_id = 2;
+  enc.slot = 0;
+  enc.encounter_type_id = 0;
+  enc.participants = {0, 1};
+
+  auto locations = initLocations(tw.world);
+  auto injected = simulateEncounterInjection({enc}, 0, locations, tw.world,
+                                             tw.config, &pm, 5.0);
+
+  CHECK(injected.empty());
+  CHECK(locations[0].venue_id == 0);
+  CHECK(locations[1].venue_id == 0);
+  CHECK(locations[0].encounter_type_id == 255);
+  CHECK(locations[1].encounter_type_id == 255);
+}
+
+TEST_CASE("7h. Venue gate — same policy, encounter at an ungated venue fires") {
+  /**
+   * SCENARIO:
+   *   Identical to 7g except the encounter is hosted at a home venue. "home"
+   *   is not in the gate's mask, so the override does not apply and the
+   *   encounter proceeds. This is the allowed_venues modelling lever: the
+   *   same gathering written as ["household"] survives close_pubs.
+   */
+  auto tw = buildEncounterWorld(
+      2, 1, "pub", "friendships", "pub_meetups", false, "", {"leisure"},
+      InviteDistribution{DistributionType::FIXED, 1.0, 0.5, 1}, 1.0, 1.0);
+
+  PolicyManager pm(tw.world);
+  auto disease = addVenueGatedPolicy(pm, tw.world, {"leisure"}, {"pub"}, 0.0,
+                                     10.0);
+
+  tw.world.people[0].applicable_temporal_policy_mask = 1;
+  tw.world.people[1].applicable_temporal_policy_mask = 1;
+
+  CoordinatedEncounter enc;
+  enc.encounter_id = 701;
+  enc.host_id = 0;
+  enc.venue_id = 0;  // host's home, venue type "home"
+  enc.venue_type_id = 0;
+  enc.slot = 0;
+  enc.encounter_type_id = 0;
+  enc.participants = {0, 1};
+
+  auto locations = initLocations(tw.world);
+  auto injected = simulateEncounterInjection({enc}, 0, locations, tw.world,
+                                             tw.config, &pm, 5.0);
+
+  CHECK(injected.count(0) == 1);
+  CHECK(injected.count(1) == 1);
+  CHECK(locations[0].encounter_type_id == 0);
+  CHECK(locations[1].encounter_type_id == 0);
+}
+
+TEST_CASE("7i. Venue gate — activity-only policy blocks as it always has") {
+  /**
+   * SCENARIO:
+   *   Same encounter as 7h (ungated home venue), but the policy carries no
+   *   venue types at all. It must still block on the activity alone,
+   *   unchanged by the venue the gate now reads.
+   */
+  auto tw = buildEncounterWorld(
+      2, 1, "pub", "friendships", "pub_meetups", false, "", {"leisure"},
+      InviteDistribution{DistributionType::FIXED, 1.0, 0.5, 1}, 1.0, 1.0);
+
+  PolicyManager pm(tw.world);
+  auto disease =
+      addVenueGatedPolicy(pm, tw.world, {"leisure"}, {}, 0.0, 10.0);
+
+  tw.world.people[0].applicable_temporal_policy_mask = 1;
+  tw.world.people[1].applicable_temporal_policy_mask = 1;
+
+  CoordinatedEncounter enc;
+  enc.encounter_id = 702;
+  enc.host_id = 0;
+  enc.venue_id = 0;
+  enc.venue_type_id = 0;
+  enc.slot = 0;
+  enc.encounter_type_id = 0;
+  enc.participants = {0, 1};
+
+  auto locations = initLocations(tw.world);
+  auto injected = simulateEncounterInjection({enc}, 0, locations, tw.world,
+                                             tw.config, &pm, 5.0);
+
+  CHECK(injected.empty());
+}
+
+TEST_CASE("7j. Venue gate — a virtual encounter is at no venue, so never gated") {
+  /**
+   * SCENARIO:
+   *   CoordinatedEncounter::venue_type_id is polysemous: a world venue-type id
+   *   for a physical encounter, an id into the alphabetically-sorted contact
+   *   matrix registry for a virtual one. The two registries are ordered
+   *   independently, so the integers alias.
+   *
+   *   The collision is built deliberately here. Matrix keys sort to
+   *   {home, office, online_chat, pub}, so the virtual encounter's matrix id
+   *   is 2 — numerically identical to the physical venue type "pub", which
+   *   close_pubs gates on.
+   *
+   *   A virtual encounter is at no Venue at all, so the gate must not fire and
+   *   the encounter proceeds. Reading venue_type_id here instead would gate a
+   *   video call as if it were a pub.
+   */
+  auto tw = buildEncounterWorld(
+      2, 0, "pub", "friendships", "online_meetups", true, "online_chat",
+      {"leisure"}, InviteDistribution{DistributionType::FIXED, 1.0, 0.5, 1},
+      1.0, 1.0);
+
+  // The collision the test rests on.
+  REQUIRE(tw.config.contact_matrices.matrix_name_to_id.at("online_chat") ==
+          tw.world.getVenueTypeIndex("pub"));
+
+  PolicyManager pm(tw.world);
+  auto disease = addVenueGatedPolicy(pm, tw.world, {"leisure"}, {"pub"}, 0.0,
+                                     10.0);
+
+  tw.world.people[0].applicable_temporal_policy_mask = 1;
+  tw.world.people[1].applicable_temporal_policy_mask = 1;
+
+  CoordinatedEncounter enc;
+  enc.encounter_id = 703;
+  enc.host_id = 0;
+  enc.venue_id = -5000;  // virtual: no venue
+  enc.venue_type_id = static_cast<uint8_t>(
+      tw.config.contact_matrices.matrix_name_to_id.at("online_chat"));
+  enc.slot = 0;
+  enc.encounter_type_id = 0;
+  enc.participants = {0, 1};
+
+  auto locations = initLocations(tw.world);
+  auto injected = simulateEncounterInjection({enc}, 0, locations, tw.world,
+                                             tw.config, &pm, 5.0);
+
+  CHECK(injected.count(0) == 1);
+  CHECK(injected.count(1) == 1);
+}
+
+TEST_CASE("7k. Venue gate — a physical encounter gates on its own venue type") {
+  /**
+   * SCENARIO:
+   *   As 7g, but the encounter's venue is one this rank cannot type (a
+   *   cross-rank host's venue). The encounter carries its type, so the gate
+   *   answers from enc.venue_type_id and blocks — no local lookup, no
+   *   silent 255 fail-open, and no rank-dependent answer.
+   */
+  auto tw = buildEncounterWorld(
+      2, 1, "pub", "friendships", "pub_meetups", false, "", {"leisure"},
+      InviteDistribution{DistributionType::FIXED, 1.0, 0.5, 1}, 1.0, 1.0);
+
+  PolicyManager pm(tw.world);
+  auto disease = addVenueGatedPolicy(pm, tw.world, {"leisure"}, {"pub"}, 0.0,
+                                     10.0);
+
+  tw.world.people[0].applicable_temporal_policy_mask = 1;
+  tw.world.people[1].applicable_temporal_policy_mask = 1;
+
+  CoordinatedEncounter enc;
+  enc.encounter_id = 704;
+  enc.host_id = 0;
+  enc.venue_id = 999;  // not in this rank's world
+  enc.venue_type_id = static_cast<uint8_t>(tw.world.getVenueTypeIndex("pub"));
+  enc.slot = 0;
+  enc.encounter_type_id = 0;
+  enc.participants = {0, 1};
+
+  auto locations = initLocations(tw.world);
+  auto injected = simulateEncounterInjection({enc}, 0, locations, tw.world,
+                                             tw.config, &pm, 5.0);
+
+  CHECK(injected.empty());
+}
+
+/**
+ * Builds a Disease whose single stage is "sick" for 100 days, so
+ * getCurrentSymptomId is the same at every time the test asks about. The
+ * section's createMinimalDisease has no trajectories, which is why 7a/7b have
+ * to hedge on whether the symptom fired.
+ */
+static Disease buildAlwaysSickDisease() {
+  TransmissionParams transmission;
+  transmission.mode = InfectiousnessMode::STAGE_DRIVEN;
+  auto curve = std::make_shared<ConstantCurve>(1.0);
+  transmission.stage_curves["sick"] = curve;
+  transmission.symptom_id_curves = {nullptr, curve};
+
+  std::vector<SymptomTag> symptom_tags = {{"healthy", -1, 0}, {"sick", 1, 1}};
+  DiseaseStageSettings stage_settings;
+  stage_settings.recovered_stages = {"healthy"};
+
+  TrajectoryDefinition trajectory;
+  trajectory.selection_key = "general";
+  trajectory.severity = 1.0;
+  trajectory.stages.push_back({"sick", {"constant", {{"value", 100.0}}}});
+
+  return Disease("TestDisease", symptom_tags, stage_settings, {trajectory}, {},
+                 transmission);
+}
+
+TEST_CASE("7l. Eligibility asks the policy question and pins nobody") {
+  /**
+   * SCENARIO:
+   *   Person 1 is a hopped traveller, sick, under a freeze_in_place policy
+   *   covering "leisure". They are invited to an encounter at a pub.
+   *
+   *   Eligibility must answer "yes, a policy suppresses them" and stop there.
+   *   Establishing the freeze is ActivityManager's job: pass 1 sees the
+   *   encounter's venue, not the venue the person is actually at, so a pin
+   *   written here anchors them somewhere they never went — for the whole
+   *   freeze, and even if the encounter is cancelled below min_attendees a
+   *   few lines later (which here it is).
+   */
+  auto tw = buildEncounterWorld(
+      2, 1, "pub", "friendships", "pub_meetups", false, "", {"leisure"},
+      InviteDistribution{DistributionType::FIXED, 1.0, 0.5, 1}, 1.0, 1.0);
+
+  Disease disease = buildAlwaysSickDisease();
+
+  PolicyManager pm(tw.world);
+  SymptomPolicy freeze_when_sick;
+  freeze_when_sick.name = "freeze_traveller_when_sick";
+  freeze_when_sick.trigger_symptoms = {"sick"};
+  freeze_when_sick.action.override_activities = {"leisure"};
+  freeze_when_sick.action.replacement_activity = "residence";
+  freeze_when_sick.action.compliance_rate = 1.0;
+  // Set before adding: resolve() only fills this in from a named schedule.
+  freeze_when_sick.action.replacement_schedule_idx = 0;
+  pm.addSymptomPolicy(freeze_when_sick);
+  pm.resolveAll(disease);
+
+  Person& traveller = tw.world.people[1];
+  traveller.infection = std::make_unique<Infection>(&disease, 0.0, &traveller,
+                                                    42, nullptr, "household", 0);
+  traveller.applicable_symptom_policy_mask = 1;
+  constexpr int16_t kHoppedSchedule = 3;
+  constexpr int16_t kReturnSchedule = 1;
+  traveller.schedule_hop = ScheduleHop::begin(kHoppedSchedule, kReturnSchedule);
+
+  CoordinatedEncounter enc;
+  enc.encounter_id = 705;
+  enc.host_id = 0;
+  enc.venue_id = 100;
+  enc.venue_type_id = static_cast<uint8_t>(tw.world.getVenueTypeIndex("pub"));
+  enc.slot = 0;
+  enc.encounter_type_id = 0;
+  enc.participants = {0, 1};
+
+  auto locations = initLocations(tw.world);
+  auto injected = simulateEncounterInjection({enc}, 0, locations, tw.world,
+                                             tw.config, &pm, 5.0);
+
+  // The verdict is unchanged: suppressed, so the encounter falls below 2.
+  CHECK(injected.empty());
+
+  // The consequences are not eligibility's to commit.
+  CHECK(pm.getFrozenStates().empty());
+  CHECK(traveller.schedule_hop.hopped_schedule_id == kHoppedSchedule);
+  CHECK(traveller.schedule_hop.return_schedule_id == kReturnSchedule);
+}
+
+TEST_CASE("7m. Eligibility latches no compliance decision") {
+  /**
+   * SCENARIO:
+   *   A lockdown at compliance 0.5 over participants who have not yet been
+   *   through ActivityManager this slot, so no decision is latched yet.
+   *
+   *   Eligibility must read the coin, not toss and record it. Its answer has
+   *   to match what the authoritative caller goes on to latch — a query that
+   *   disagreed with the override would put people in an encounter the policy
+   *   then moves them out of.
+   */
+  auto tw = buildEncounterWorld(
+      2, 1, "pub", "friendships", "pub_meetups", false, "", {"leisure"},
+      InviteDistribution{DistributionType::FIXED, 1.0, 0.5, 1}, 1.0, 1.0);
+
+  PolicyManager pm(tw.world);
+  addLockdownPolicy(pm, tw.world, 0.0, 10.0, 0.5);
+  tw.world.people[0].applicable_temporal_policy_mask = 1;
+  tw.world.people[1].applicable_temporal_policy_mask = 1;
+
+  CoordinatedEncounter enc;
+  enc.encounter_id = 706;
+  enc.host_id = 0;
+  enc.venue_id = 100;
+  enc.venue_type_id = static_cast<uint8_t>(tw.world.getVenueTypeIndex("pub"));
+  enc.slot = 0;
+  enc.encounter_type_id = 0;
+  enc.participants = {0, 1};
+
+  auto locations = initLocations(tw.world);
+  auto lookups = june::encounters::buildEncounterLookups(
+      tw.world, tw.config.coordinated_encounters.encounters);
+  auto slot_encounters = june::encounters::computeLocalEligibility(
+      {enc}, 0, 5.0, lookups, tw.world, locations, &pm);
+
+  REQUIRE(slot_encounters.size() == 1);
+  std::set<size_t> eligible(slot_encounters[0].eligible_indices.begin(),
+                            slot_encounters[0].eligible_indices.end());
+
+  const int16_t leisure =
+      static_cast<int16_t>(tw.world.getActivityIndex("leisure"));
+  for (size_t i = 0; i < tw.world.people.size(); ++i) {
+    Person& person = tw.world.people[i];
+    CHECK(person.temporal_policy_decisions == 0);
+
+    // The authoritative caller now runs and latches. Suppressed by the query
+    // iff overridden by ActivityManager.
+    const bool overridden =
+        pm.getOverride(person, leisure, enc.venue_id, 0,
+                       SlotVenueType::known(enc.venue_type_id), 5.0, 0)
+            .has_value();
+    CHECK(overridden == (eligible.count(i) == 0));
+  }
 }
 
 // =============================================================================
@@ -2977,4 +3332,133 @@ TEST_CASE(
     if (types.size() >= 2) any_host_has_both = true;
   }
   CHECK(any_host_has_both);
+}
+
+// =============================================================================
+// SECTION 9: The virtual-venue id range
+//
+// Whether a CoordinatedEncounter is virtual is a property of the instance —
+// its reserved negative venue_id — not of a config flag reached through a
+// world-registry lookup that can miss.
+// =============================================================================
+
+TEST_CASE("9a. Virtual venue ids round-trip through their host") {
+  for (PersonId host_id : {0, 1, 42, 630205, 2147482647}) {
+    const VenueId virtual_venue_id = makeVirtualVenueId(host_id);
+    CHECK(isVirtualVenue(virtual_venue_id));
+    CHECK(occupiesNoVenue(virtual_venue_id));
+    CHECK(virtualVenueHost(virtual_venue_id) == host_id);
+  }
+
+  // Distinct by construction: two hosts never share a virtual venue.
+  CHECK(makeVirtualVenueId(0) != makeVirtualVenueId(1));
+}
+
+TEST_CASE("9b. The other negative venue ids are not virtual venues") {
+  // Both are negative — so they occupy no Venue — but neither is in the
+  // reserved range, and reading a host out of either would be nonsense.
+  CHECK(isVirtualVenue(kInvalidVenueId) == false);
+  CHECK(isVirtualVenue(INFECTION_SEED_VENUE_ID) == false);
+  CHECK(occupiesNoVenue(kInvalidVenueId));
+  CHECK(occupiesNoVenue(INFECTION_SEED_VENUE_ID));
+
+  // A real venue is neither.
+  CHECK(isVirtualVenue(0) == false);
+  CHECK(occupiesNoVenue(0) == false);
+
+  // The boundary belongs to host 0.
+  CHECK(isVirtualVenue(kVirtualVenueIdBase));
+  CHECK(isVirtualVenue(kVirtualVenueIdBase + 1) == false);
+}
+
+TEST_CASE("9c. Eligibility reads the instance, not the lookup tables") {
+  /**
+   * SCENARIO:
+   *   A Virtual Encounter whose encounter_type_id is absent from every
+   *   EncounterLookups map — the shape a def name missing from the world's
+   *   encounter-type registry used to produce. Trigger activities are
+   *   supplied by hand so the policy is genuinely consulted; nothing in the
+   *   lookups says the encounter is virtual.
+   *
+   *   The Slot Venue Type must still be absent, so the venue gate on "pub"
+   *   cannot reach the participants and the encounter proceeds.
+   *
+   * REGRESSION: the discriminator was the def's is_virtual flag, looked up on
+   *   encounter_type_id. On a miss the encounter read as physical and handed
+   *   venue_type_id — a contact-matrix registry id — to a Venue-type gate.
+   */
+  auto tw = buildEncounterWorld(
+      2, 1, "pub", "friendships", "pub_meetups", false, "", {"leisure"},
+      InviteDistribution{DistributionType::FIXED, 1.0, 0.5, 1}, 1.0, 1.0);
+
+  PolicyManager pm(tw.world);
+  auto disease = addVenueGatedPolicy(pm, tw.world, {"leisure"}, {"pub"}, 0.0,
+                                     10.0);
+  tw.world.people[0].applicable_temporal_policy_mask = 1;
+  tw.world.people[1].applicable_temporal_policy_mask = 1;
+
+  const uint8_t unregistered_encounter_type = 7;
+
+  CoordinatedEncounter enc;
+  enc.encounter_id = 900;
+  enc.host_id = 0;
+  enc.venue_id = makeVirtualVenueId(0);
+  // Aliases the "pub" venue type on purpose: for a virtual encounter this
+  // field is a contact-matrix id, and nothing may gate on it.
+  enc.venue_type_id = 2;
+  enc.slot = 0;
+  enc.encounter_type_id = unregistered_encounter_type;
+  enc.participants = {0, 1};
+
+  june::encounters::EncounterLookups lookups;
+  lookups.trigger_activities[unregistered_encounter_type] = {
+      static_cast<int16_t>(tw.world.getActivityIndex("leisure"))};
+  lookups.min_attendees[unregistered_encounter_type] = 2;
+
+  auto locations = initLocations(tw.world);
+  auto slot_encounters = june::encounters::computeLocalEligibility(
+      {enc}, 0, 5.0, lookups, tw.world, locations, &pm);
+
+  REQUIRE(slot_encounters.size() == 1);
+  CHECK(slot_encounters[0].local_eligible == 2);
+  CHECK(slot_encounters[0].min_required == 2);
+}
+
+TEST_CASE("9d. A virtual encounter carrying an unresolvable type never gates") {
+  /**
+   * SCENARIO: as 9c, but venue_type_id is kUnknownVenueTypeId — the value
+   * SlotVenueType::known() refuses. Under the old discriminator a lookup miss
+   * sent that straight to known() and aborted the run. It must not be read at
+   * all now.
+   */
+  auto tw = buildEncounterWorld(
+      2, 1, "pub", "friendships", "pub_meetups", false, "", {"leisure"},
+      InviteDistribution{DistributionType::FIXED, 1.0, 0.5, 1}, 1.0, 1.0);
+
+  PolicyManager pm(tw.world);
+  auto disease = addVenueGatedPolicy(pm, tw.world, {"leisure"}, {"pub"}, 0.0,
+                                     10.0);
+  tw.world.people[0].applicable_temporal_policy_mask = 1;
+  tw.world.people[1].applicable_temporal_policy_mask = 1;
+
+  CoordinatedEncounter enc;
+  enc.encounter_id = 901;
+  enc.host_id = 1;
+  enc.venue_id = makeVirtualVenueId(1);
+  enc.venue_type_id = kUnknownVenueTypeId;
+  enc.slot = 0;
+  enc.encounter_type_id = 9;
+  enc.participants = {0, 1};
+
+  june::encounters::EncounterLookups lookups;
+  lookups.trigger_activities[9] = {
+      static_cast<int16_t>(tw.world.getActivityIndex("leisure"))};
+  lookups.min_attendees[9] = 2;
+
+  auto locations = initLocations(tw.world);
+  std::vector<june::encounters::EncounterEligibility> slot_encounters;
+  REQUIRE_NOTHROW(slot_encounters = june::encounters::computeLocalEligibility(
+                      {enc}, 0, 5.0, lookups, tw.world, locations, &pm));
+  REQUIRE(slot_encounters.size() == 1);
+  CHECK(slot_encounters[0].local_eligible == 2);
 }

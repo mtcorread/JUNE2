@@ -27,6 +27,10 @@ BUILD_DIR="${BUILD_DIR:-${PROJECT_DIR}/build}"
 DAYS="${DAYS:-10}"
 CONFIG="${CONFIG:-configs/config_2021/simulation.yaml}"
 WORLD="${WORLD:-worlds/world_2021.h5}"
+# Optional infection-seeds file, overriding the one the config names. Set it to
+# exercise a seeding variant (e.g. structured seeds above the partition level)
+# without a second config directory.
+SEEDS="${SEEDS:-}"
 # Space-separated list of rank counts to compare. Must include 1 as the
 # reference.
 NPS="${NPS:-1 2 3}"
@@ -36,9 +40,11 @@ if [[ ! -x "$BINARY" ]]; then
   echo "FAIL: binary not found at $BINARY"
   exit 1
 fi
+# The world file is not committed, so CI has no way to run this. Skip (ctest
+# SKIP_RETURN_CODE 77) rather than fail, matching test_checkpoint_determinism.
 if [[ ! -f "${PROJECT_DIR}/${WORLD}" ]]; then
-  echo "FAIL: world not found at ${PROJECT_DIR}/${WORLD}"
-  exit 1
+  echo "SKIP: world not found at ${PROJECT_DIR}/${WORLD}"
+  exit 77
 fi
 
 cd "$PROJECT_DIR"
@@ -51,13 +57,23 @@ echo "=== MPI full-reproducibility test ==="
 echo "  binary: $BINARY"
 echo "  days:   $DAYS"
 echo "  nps:    $NPS"
+[[ -n "$SEEDS" ]] && echo "  seeds:  $SEEDS"
 echo "  tmp:    $TMP"
 echo ""
 
 # --- config override for day count -------------------------------------------
+# Derived from the config's own start_date, so the harness follows the config's
+# calendar rather than pinning one of its own.
+START_DATE=$(sed -n 's/^[[:space:]]*start_date[[:space:]]*:[[:space:]]*"\([0-9-]*\)".*/\1/p' \
+  "${PROJECT_DIR}/${CONFIG}" | head -1)
+if [[ -z "$START_DATE" ]]; then
+  echo "FAIL: no start_date in ${CONFIG}"
+  exit 1
+fi
 END_DATE=$(python3 -c "
 from datetime import datetime, timedelta
-print((datetime(2024,1,1)+timedelta(days=${DAYS})).strftime('%Y-%m-%d'))
+start = datetime.strptime('${START_DATE}', '%Y-%m-%d')
+print((start + timedelta(days=${DAYS})).strftime('%Y-%m-%d'))
 ")
 cp "$CONFIG" "$TMP/simulation.yaml"
 if [[ "$(uname)" == "Darwin" ]]; then
@@ -74,9 +90,12 @@ for NP in $NPS; do
   RUN_ID="np${NP}"
   RUN_DIR="$TMP/runs/${RUN_ID}"
   OUT="$TMP/sim_np${NP}.h5"
+  SEEDS_ARG=()
+  [[ -n "$SEEDS" ]] && SEEDS_ARG=(--infection_seeds "$SEEDS")
   mpirun -np "$NP" --oversubscribe "$BINARY" \
     --config "$TMP/simulation.yaml" \
     --world "$WORLD" \
+    "${SEEDS_ARG[@]}" \
     --runs-dir "$TMP/runs" \
     --run-id "$RUN_ID" \
     > "$TMP/log_np${NP}.txt" 2>&1 || {
@@ -235,9 +254,22 @@ echo "=== infection-count log diff ==="
 for NP in $NPS; do
   grep "Total currently infected" "$TMP/log_np${NP}.txt" \
     | awk '{print $4}' > "$TMP/infect_np${NP}.txt"
+  # A structured seed places an absolute count, so the per-step seeded totals
+  # are an invariant in their own right: they diverge before the day counts do
+  # when a seed resolves per rank rather than globally.
+  grep "\[INFECTION SEED\] Seeded" "$TMP/log_np${NP}.txt" \
+    | awk '{print $4}' > "$TMP/seeded_np${NP}.txt"
 done
 for NP in $NPS; do
   [[ "$NP" == "$REF_NP" ]] && continue
+  if ! diff -q "$TMP/seeded_np${REF_NP}.txt" "$TMP/seeded_np${NP}.txt" > /dev/null; then
+    echo "FAIL: seeded counts diverge between np=${REF_NP} and np=${NP}"
+    diff -u "$TMP/seeded_np${REF_NP}.txt" "$TMP/seeded_np${NP}.txt" | head -20
+    CLEAN_ON_EXIT=0
+    FAIL=1
+  else
+    echo "  PASS seeded counts: identical np=${REF_NP} vs np=${NP}"
+  fi
   if ! diff -q "$TMP/infect_np${REF_NP}.txt" "$TMP/infect_np${NP}.txt" > /dev/null; then
     echo "FAIL: infection counts diverge between np=${REF_NP} and np=${NP}"
     diff -u "$TMP/infect_np${REF_NP}.txt" "$TMP/infect_np${NP}.txt" | head -20

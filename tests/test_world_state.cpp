@@ -260,8 +260,8 @@ TEST_CASE("getVenuesInGeoUnit includes non-local venues from global maps") {
   world.global_venues_by_type_name["guest_house"] = {100, 200};
   world.global_venue_geo_unit_map[100] = 10;
   world.global_venue_geo_unit_map[200] = 10;  // remote venue, same geo_unit
-  world.global_venue_type_map[100] = 0;
-  world.global_venue_type_map[200] = 0;
+  world.setGlobalVenueType(100, 0);
+  world.setGlobalVenueType(200, 0);
 
   world.buildIndices();  // must not overwrite the pre-populated global maps
 

@@ -7,9 +7,14 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
 
 #include "core/config.h"
 #include "core/world_state.h"
+#include "parallel/domain.h"
 #include "parallel/domain_manager.h"
 #include "parallel/geography_partitioner.h"
 
@@ -428,6 +433,86 @@ TEST_CASE_FIXTURE(
     CHECK(received.empty());
     // Original local_finalized is untouched
     CHECK(local_finalized.size() == 1);
+  }
+}
+
+// A world whose people all live in the geo unit that holds their home, plus an
+// optional straddler: person 2 sits in geo unit 0 but is housed in venue 1,
+// which belongs to geo unit 1.
+static WorldState buildResidenceWorld(bool with_straddler) {
+  WorldState world;
+  world.activity_names = {"residence"};
+  world.venue_type_names = {"home"};
+  world.geo_level_names = {"MGU"};
+
+  for (GeoUnitId geo_unit_id : {0, 1}) {
+    GeographicalUnit unit;
+    unit.id = geo_unit_id;
+    unit.name = "MGU" + std::to_string(geo_unit_id + 1);
+    unit.level_id = 0;
+    unit.parent_id = -1;
+    world.geo_units.push_back(unit);
+
+    Venue home;
+    home.id = geo_unit_id;
+    home.type_id = 0;
+    home.geo_unit_id = geo_unit_id;
+    world.venues.push_back(home);
+  }
+
+  // (person geo unit, home venue): two housed where they live, then the
+  // straddler.
+  std::vector<std::pair<GeoUnitId, VenueId>> residents = {{0, 0}, {0, 0}};
+  if (with_straddler) residents.push_back({0, 1});
+
+  for (size_t i = 0; i < residents.size(); ++i) {
+    Person& person = world.people.emplace_back();
+    person.id = static_cast<PersonId>(i);
+    person.geo_unit_id = residents[i].first;
+    person.activity_meta_start =
+        static_cast<uint32_t>(world.activity_meta.size());
+    person.activity_meta_count = 1;
+    world.activity_meta.push_back(
+        {0, static_cast<uint32_t>(world.activity_venues.size()), 1});
+    world.activity_venues.push_back({residents[i].second, 0});
+  }
+
+  world.buildIndices();
+  return world;
+}
+
+TEST_CASE("Domain: a residence venue and its occupants share a geo unit") {
+  int rank = 0;
+  int num_ranks = 1;
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  MPI_Comm_size(MPI_COMM_WORLD, &num_ranks);
+
+  // No collectives here: every rank builds the same world and checks it alone,
+  // so the result does not depend on the rank count. That is the point of
+  // testing geo units rather than ownership (ADR 0012) -- an ownership test
+  // would pass vacuously at np=1.
+  SUBCASE("a household inside the owned geo unit passes") {
+    WorldState world = buildResidenceWorld(false);
+    Domain domain(rank, num_ranks, &world);
+    domain.addGeoUnit(0);
+
+    CHECK_NOTHROW(domain.assignPeopleAndVenues());
+    CHECK(domain.local_population == 2);
+  }
+
+  SUBCASE("a resident housed in another geo unit is fatal, and is named") {
+    WorldState world = buildResidenceWorld(true);
+    Domain domain(rank, num_ranks, &world);
+    domain.addGeoUnit(0);
+
+    REQUIRE_THROWS_AS(domain.assignPeopleAndVenues(), std::runtime_error);
+    try {
+      domain.assignPeopleAndVenues();
+    } catch (const std::runtime_error& error) {
+      const std::string message = error.what();
+      CHECK(message.find("person 2") != std::string::npos);
+      CHECK(message.find("ADR 0012") != std::string::npos);
+    }
   }
 }
 

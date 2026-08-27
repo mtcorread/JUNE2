@@ -181,10 +181,10 @@ bool CoordinatedEncounterManager::tryEmitForOneSlot(
 
   VenueSelection venue = selectVenue(person, enc_def, virtual_v_type, gen);
   if (enc_def.is_virtual) {
-    // Virtual venue IDs use the host's person_id directly, making collisions
-    // impossible by construction. A person can only host one encounter per
-    // slot per type, so person_id is a unique key.
-    venue.id = -1000 - person.id;
+    // The reserved virtual range encodes the host, so collisions are
+    // impossible by construction: a person hosts at most one encounter per
+    // slot per type.
+    venue.id = makeVirtualVenueId(person.id);
   } else if (!venue.valid) {
     return false;
   }
@@ -367,6 +367,18 @@ void CoordinatedEncounterManager::emitProposals(
     const Person& person, const CoordinatedEncounterDef& enc_def, int slot_idx,
     const VenueSelection& venue, std::vector<PersonId>& eligible_partners,
     SplitMix64& gen, std::vector<EncounterProposal>& out_proposals) {
+  // The proposal is the single manufacture point for the venue type every
+  // downstream participant reads: the reply copies it, and so does the
+  // finalised encounter. An unresolvable type here would survive as far as
+  // def matching and be dropped as a no-matching-def warning, so refuse it
+  // where the defect is. A venue type sitting at registry index 255 aliases
+  // kUnknownVenueTypeId, so this is reachable, not defensive. Checked once
+  // per encounter — the venue does not vary across the invitees.
+  if (!occupiesNoVenue(venue.id) && venue.type_id == kUnknownVenueTypeId)
+    throw std::runtime_error("coordinated encounters: physical venue " +
+                             std::to_string(venue.id) + " for encounter '" +
+                             enc_def.name + "' has an unresolvable venue type");
+
   int num_partners = static_cast<int>(eligible_partners.size());
 
   // Sample invite count from distribution, clamped to [1, num_partners]

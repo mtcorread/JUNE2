@@ -126,10 +126,25 @@ uint32_t matchMembershipRowToFlatIndex(const WorldState& world,
 void loadVenueSubsets(HDF5Loader& loader,
                       const std::unordered_set<GeoUnitId>& owned_geo_units);
 
-// Read ALL venue IDs and type_ids from HDF5 into world.global_venue_type_map.
-// Build global venue maps (type, geo_unit, and by-type-name index) covering
-// ALL venues from HDF5. Required for deterministic getVenuesInGeoUnit() in
-// MPI mode and for cross-rank type lookups in selectVenue().
+// Fill world's three global venue structures (VenueId-indexed type vector,
+// geo_unit map, by-type-name index) from the world's full venue arrays. The
+// three input vectors are parallel and cover EVERY Venue in the world, not just
+// this rank's: a rank must be able to name the type of a Venue it does not own,
+// otherwise the same value means both "no such Venue" and "not decomposed onto
+// me" and venue-gated policy becomes rank-dependent. Throws if the three
+// lengths disagree; warns (never throws) if the ids are sparse.
+//
+// Split out from buildGlobalVenueMaps so it can be tested without an
+// HDF5Loader.
+void fillGlobalVenueMaps(WorldState& world,
+                         const std::vector<int32_t>& venue_ids,
+                         const std::vector<uint8_t>& venue_type_ids,
+                         const std::vector<GeoUnitId>& venue_geo_unit_ids);
+
+// Read ALL venue IDs and type_ids from HDF5, reconstruct venue→geo_unit from
+// the partition index, then hand all three to fillGlobalVenueMaps(). Required
+// for deterministic getVenuesInGeoUnit() in MPI mode and for cross-rank type
+// lookups in selectVenue().
 void buildGlobalVenueMaps(HDF5Loader& loader);
 
 }  // namespace detail

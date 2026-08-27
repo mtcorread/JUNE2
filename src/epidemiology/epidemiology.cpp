@@ -1,5 +1,7 @@
 #include "epidemiology/epidemiology.h"
 
+#include "epidemiology/policy.h"
+
 namespace june {
 
 Epidemiology::Epidemiology(WorldState& world, const Disease* disease,
@@ -130,6 +132,7 @@ EpiSlotStats Epidemiology::updateInfectionStates(
         // Clear infection
         person->infection.reset();
         person->resetPolicyState();
+        if (policy_manager_) policy_manager_->releaseAnyFreeze(*person);
         last_processed_transition_time_.erase(pid);
         to_remove.push_back(pid);
         recoveries++;
@@ -156,6 +159,7 @@ EpiSlotStats Epidemiology::updateInfectionStates(
         // Clear infection
         person->infection.reset();
         person->resetPolicyState();
+        if (policy_manager_) policy_manager_->releaseAnyFreeze(*person);
         last_processed_transition_time_.erase(pid);
         to_remove.push_back(pid);
         deaths++;

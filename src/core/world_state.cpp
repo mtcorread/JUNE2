@@ -24,10 +24,10 @@ void WorldState::buildIndices() {
     } else {
       venues_by_type["unknown"].push_back(i);
     }
-    // global_venue_type_map is not populated for local venues: getVenueTypeId()
-    // resolves them via getVenue() first, so the map only ever needs the
-    // foreign halo (filled by the HDF5 loader's buildGlobalVenueMaps in MPI
-    // mode).
+    // venue_type_by_id is not touched here: for a hand-built WorldState
+    // getVenueTypeId() resolves every venue via getVenue(), and for an
+    // HDF5-loaded one the loader's buildGlobalVenueMaps has already filled it
+    // for every Venue in the world, at any rank count.
   }
 
   for (size_t i = 0; i < geo_units.size(); ++i) {
@@ -35,8 +35,10 @@ void WorldState::buildIndices() {
   }
 
   people_by_geo_unit.clear();
+  directly_inhabited_geo_units.clear();
   for (size_t i = 0; i < people.size(); ++i) {
     GeoUnitId current_id = people[i].geo_unit_id;
+    if (current_id != -1) directly_inhabited_geo_units.insert(current_id);
     while (current_id != -1) {
       people_by_geo_unit[current_id].push_back(i);
 
@@ -54,6 +56,14 @@ void WorldState::addVenueToTypeIndex(VenueId venue_id, uint8_t type_id) {
                                      ? venue_type_names[type_id]
                                      : "unknown";
   global_venues_by_type_name[type_name].push_back(venue_id);
+}
+
+void WorldState::setGlobalVenueType(VenueId venue_id, uint8_t type_id) {
+  if (venue_id < 0) return;
+  const size_t index = static_cast<size_t>(venue_id);
+  if (index >= venue_type_by_id.size())
+    venue_type_by_id.resize(index + 1, kUnknownVenueTypeId);
+  venue_type_by_id[index] = type_id;
 }
 
 void WorldState::sortGlobalVenuesByTypeName() {
@@ -158,7 +168,9 @@ void WorldState::dropGlobalVenueMaps() {
   std::cerr << "[HALO] freeing OTF maps: geo_unit_map_entries="
             << global_venue_geo_unit_map.size()
             << " by_type_name_venue_entries=" << by_type_venues
-            << " (type_map kept, entries=" << global_venue_type_map.size()
+            << " (all-venue type index kept, entries="
+            << venue_type_by_id.size()
+            << " bytes=" << venue_type_by_id.capacity() * sizeof(uint8_t)
             << ")\n";
   std::unordered_map<VenueId, GeoUnitId>().swap(global_venue_geo_unit_map);
   std::unordered_map<std::string, std::vector<VenueId>>().swap(

@@ -10,6 +10,7 @@
 #include "core/config.h"
 #include "core/types.h"
 #include "core/world_state.h"
+#include "epidemiology/policy.h"  // SlotVenueType, passed by value below
 
 #ifdef USE_MPI
 #include <mpi.h>
@@ -151,8 +152,13 @@ class ActivityManager {
   // by the override) iff policy_manager_ is set and yields an override.
   // Effective-venue resolution and post-override person_id/person_array_index
   // re-set are left to callers (they vary across the four call sites).
+  //
+  // venue/subset are the Pin Venue only. The Slot Venue Type is passed
+  // separately because the hop call sites substitute the last overnight venue
+  // into the pin for a traveller in transit, who occupies no venue at all.
   bool applyPolicyOverride(PersonLocation& loc, Person& person,
                            int16_t activity, VenueId venue, SubsetIndex subset,
+                           SlotVenueType slot_venue_type,
                            int time_slot_index);
 
   // Returns the TimeSlot at time_slot_index for the given schedule type and

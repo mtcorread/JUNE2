@@ -12,6 +12,7 @@
 #include "core/config.h"  // For AgeGroup definition
 #include "core/types.h"
 #include "core/world_state.h"
+#include "epidemiology/seeding/seed_shortfall.h"
 #include "utils/event_logging/event_logger.h"
 
 namespace june {
@@ -35,6 +36,11 @@ struct InfectionSeedGlobalConfig {
 // Target group defining which people to infect based on any property
 struct SeedTargetGroup {
   std::vector<SelectionCriterion> criteria;
+  // How the config named this group, kept only so a report can say which group
+  // it means — "0-17" rather than "budget 0". Never read by matching. Empty
+  // where the config gives no name to keep, as bulk CSV seeds do, and a report
+  // then falls back to the budget index.
+  std::string label;
 
   bool matches(const Person& person, const WorldState* world) const {
     if (criteria.empty()) return true;
@@ -46,15 +52,35 @@ struct SeedTargetGroup {
 
   void resolve(const WorldState& world) {
     for (auto& c : criteria) {
-      c.resolve(world);
+      c.resolveOrThrow(world, "infection seed target group");
     }
   }
 };
 
-// Cases for a specific geographic area and target groups
+// A number of cases to place, plus the target groups a person may match to be
+// drawn against it. An empty eligible_target_groups means no demographic
+// restriction. Budget shape is settled once, at config load:
+//   per-group list -> one budget per declared group;
+//   scalar         -> one budget, eligible across every declared group;
+//   no groups      -> one unrestricted budget.
+struct SeedBudget {
+  int cases = 0;
+  std::vector<size_t> eligible_target_groups;
+
+  bool accepts(const Person& person, const WorldState* world,
+               const std::vector<SeedTargetGroup>& target_groups) const {
+    if (eligible_target_groups.empty()) return true;
+    for (size_t group_index : eligible_target_groups) {
+      if (target_groups[group_index].matches(person, world)) return true;
+    }
+    return false;
+  }
+};
+
+// Cases for a specific geographic area
 struct UnitCases {
   std::string unit_id;  // e.g., geographic unit code or name
-  std::vector<int> cases_per_target_group;  // Number of cases per target group
+  std::vector<SeedBudget> budgets;
 };
 
 // Configuration for exact/clustered seeding
@@ -116,8 +142,9 @@ struct InfectionSeedConfig {
 // Infection Seeding Implementation
 // =============================================================================
 
-// Forward declaration
+// Forward declarations
 class Disease;
+class SeedOfferExchange;
 
 class InfectionSeeder {
  public:
@@ -129,6 +156,20 @@ class InfectionSeeder {
   // Returns IDs of people infected
   std::vector<PersonId> seedInfections(const std::string& current_datetime,
                                        double simulation_time);
+
+  // Structured seeds are counted globally: the seeder offers its local
+  // candidates and the exchange pools every rank's offers. Without one (a
+  // serial run) the local offers are the whole world.
+  void setOfferExchange(const SeedOfferExchange* exchange) {
+    seed_offer_exchange_ = exchange;
+  }
+
+  // Budgets the last seeding step could not fill. Identical on every rank —
+  // the offers they are derived from are pooled — so rank 0 can report them
+  // without a further collective.
+  const std::vector<SeedShortfall>& getSeedShortfalls() const {
+    return seed_shortfalls_;
+  }
 
   // Re-resolve all attribute_filter SelectionCriterion against the current
   // WorldState. Called after the world is fully loaded.
@@ -150,6 +191,8 @@ class InfectionSeeder {
   EventLogger* event_logger_;
   double current_simulation_time_;
   uint64_t base_seed_ = 0;
+  const SeedOfferExchange* seed_offer_exchange_ = nullptr;
+  std::vector<SeedShortfall> seed_shortfalls_;
 
   // Track which seeds have been applied
   std::set<std::string> applied_seeds_;

@@ -9,6 +9,7 @@
 #include "core/config.h"
 #include "core/types.h"
 #include "core/world_state.h"
+#include "epidemiology/policy.h"
 
 // Internal helpers of the follow subsystem, exposed here only so the follow
 // unit tests can drive the binding logic directly on a synthetic world. The
@@ -50,6 +51,23 @@ void rebuildCriteriaBindings(
 // for an activity the person does not have this slot.
 bool mirrorSuppressed(const FollowConfig& fc, int16_t host_activity,
                       uint8_t host_venue_type, int16_t follower_activity);
+
+// Does the follower's own policy outrank the mirror? A Policy Suppression
+// query and nothing more: true means a policy would remove the follower from
+// their own activity, so the mirror is declined and they keep their schedule.
+// Deciding not to mirror commits nothing, so no venue is taken — nobody is
+// pinned or moved here.
+//
+// The gate keys on host_venue_type, the type the mirror is about to move the
+// follower to, not the type of their own scheduled venue; a gated policy asked
+// about the latter would miss. The activity stays the follower's, since the
+// mirror leaves it alone. The type comes off the broadcastHostLocations wire,
+// since a cross-rank host's venue is outside this rank's halo and cannot be
+// typed locally. An unresolvable type throws.
+bool policySuppressesMirror(PolicyManager* policy_manager,
+                            const Person& follower,
+                            int16_t follower_activity_index,
+                            uint8_t host_venue_type, double current_time);
 
 // Stochastic enrolment: each host rolls once and gathers followers from its
 // pool. Returns {hosts that gained followers, total local followers enrolled}.

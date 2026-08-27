@@ -16,7 +16,7 @@ void PolicyManager::addTemporalPolicy(const TemporalPolicy& policy) {
 }
 
 bool PolicyManager::checkCompliance(double compliance_rate, PersonId person_id,
-                                    uint32_t policy_index) {
+                                    uint32_t policy_index) const {
   SplitMix64 rng(mix_seed(base_seed_, person_id, policy_index, 0xC0E1A9ULL));
   std::uniform_real_distribution<double> dist(0.0, 1.0);
   return dist(rng) < compliance_rate;
@@ -54,9 +54,23 @@ std::optional<PersonLocation> PolicyManager::getReplacementLocation(
 }
 
 std::optional<PersonLocation> PolicyManager::getOverride(
-    Person& person, int16_t scheduled_activity_index,
-    VenueId scheduled_venue_id, SubsetIndex scheduled_subset_index,
+    Person& person, int16_t scheduled_activity_index, VenueId pin_venue_id,
+    SubsetIndex pin_subset_index, SlotVenueType slot_venue_type,
     double current_time, int time_slot_index, const Person* partner) {
+  // Resolved lazily, and cached across both policy loops: this runs once per
+  // person per slot across the whole population, so an ungated run must never
+  // pay for the lookup. A Deferred value naming a venue this rank cannot type
+  // throws here rather than degrading to kUnknownVenueTypeId.
+  SlotVenueType resolved_slot_venue_type = slot_venue_type;
+  bool venue_type_resolved = false;
+  auto slotVenueType = [&]() -> const SlotVenueType& {
+    if (!venue_type_resolved) {
+      resolved_slot_venue_type = slot_venue_type.resolveAgainst(world_);
+      venue_type_resolved = true;
+    }
+    return resolved_slot_venue_type;
+  };
+
   // Priority 1: symptom-based policies
   if (person.infection != nullptr) {
     uint16_t current_symptom_id =
@@ -67,6 +81,16 @@ std::optional<PersonLocation> PolicyManager::getOverride(
       if (!(symptom_mask & (1u << i))) continue;
 
       const auto& policy = symptom_policies_[i];
+
+      // Out of window: the policy is not in force, so it holds nobody. A
+      // calendar edge is a change of government instruction, not a change in
+      // the person, so no follow-up policy inherits the decision.
+      if (!policy.window.contains(current_time)) {
+        releaseFreeze(person, i);
+        person.active_symptom_policy_participation &= ~(1u << i);
+        person.symptom_policy_decisions &= ~(1u << i);
+        continue;
+      }
 
       bool is_triggered = policy.triggeredBy(current_symptom_id);
 
@@ -97,15 +121,7 @@ std::optional<PersonLocation> PolicyManager::getOverride(
         }
 
         // Restore paused hop state if this policy was responsible for freezing
-        auto frozen_it = frozen_states_.find(person.id);
-        if (frozen_it != frozen_states_.end() &&
-            frozen_it->second.triggering_policy_index ==
-                static_cast<uint8_t>(i)) {
-          person.schedule_hop.restoreTargets(
-              frozen_it->second.paused_hopped_schedule_id,
-              frozen_it->second.paused_return_schedule_id);
-          frozen_states_.erase(frozen_it);
-        }
+        releaseFreeze(person, i);
 
         person.active_symptom_policy_participation &= ~(1u << i);
         person.symptom_policy_decisions &= ~(1u << i);
@@ -125,12 +141,8 @@ std::optional<PersonLocation> PolicyManager::getOverride(
           (person.active_symptom_policy_participation & (1u << i));
       if (!is_participating) continue;
 
-      if (!policy.action.shouldOverride(scheduled_activity_index)) {
-        continue;
-      }
-
-      if (policy.action.isExempt(person, scheduled_activity_index, &world_,
-                                 partner)) {
+      if (!actionApplies(policy.action, person, scheduled_activity_index,
+                         slotVenueType, partner)) {
         continue;
       }
 
@@ -154,9 +166,9 @@ std::optional<PersonLocation> PolicyManager::getOverride(
         }
 
         // First freeze: ActivityManager pre-resolves no_venue transit slots
-        // to last overnight venue, so scheduled_venue_id is the best candidate.
-        VenueId pin_venue = scheduled_venue_id;
-        SubsetIndex pin_subset = scheduled_subset_index;
+        // to the last overnight venue, so pin_venue_id is the best candidate.
+        VenueId pin_venue = pin_venue_id;
+        SubsetIndex pin_subset = pin_subset_index;
         if (pin_venue < 0) {
           auto home = world_.getActivityVenues(person, residence_act_idx_);
           if (!home.empty()) {
@@ -197,7 +209,7 @@ std::optional<PersonLocation> PolicyManager::getOverride(
 
     const auto& policy = temporal_policies_[i];
 
-    bool is_active = policy.isActive(current_time);
+    bool is_active = policy.window.contains(current_time);
 
     if (!is_active) {
       person.active_temporal_policy_participation &= ~(1u << i);
@@ -219,12 +231,8 @@ std::optional<PersonLocation> PolicyManager::getOverride(
 
     if (!is_participating) continue;
 
-    if (!policy.action.shouldOverride(scheduled_activity_index)) {
-      continue;
-    }
-
-    if (policy.action.isExempt(person, scheduled_activity_index, &world_,
-                               partner)) {
+    if (!actionApplies(policy.action, person, scheduled_activity_index,
+                       slotVenueType, partner)) {
       continue;
     }
 
@@ -235,6 +243,82 @@ std::optional<PersonLocation> PolicyManager::getOverride(
   return std::nullopt;
 }
 
+bool PolicyManager::suppressesParticipation(
+    const Person& person, int16_t activity_index,
+    const SlotVenueType& slot_venue_type, double current_time,
+    const Person* partner) const {
+  // A frozen Person is pinned at the venue the freeze anchored them to, so they
+  // are not at the encounter's venue or the host's venue whatever those are.
+  // Answered ahead of the loops: there is no meaningful venue-gate question to
+  // ask about a venue they cannot be in.
+  if (frozen_states_.count(person.id) > 0) return true;
+
+  // Same lazy resolution as getOverride, and for the same reason: this runs
+  // once per person per slot across the population, so an ungated run must
+  // never pay for the lookup.
+  SlotVenueType resolved_slot_venue_type = slot_venue_type;
+  bool venue_type_resolved = false;
+  auto slotVenueType = [&]() -> const SlotVenueType& {
+    if (!venue_type_resolved) {
+      resolved_slot_venue_type = slot_venue_type.resolveAgainst(world_);
+      venue_type_resolved = true;
+    }
+    return resolved_slot_venue_type;
+  };
+
+  // Priority 1: symptom-based policies. Untriggered policies are skipped
+  // outright — getOverride uses that branch to release a freeze and propagate
+  // follow-up inheritance, and neither is this function's business.
+  if (person.infection != nullptr) {
+    uint16_t current_symptom_id =
+        person.infection->getTrajectory().getCurrentSymptomId(current_time);
+
+    uint32_t symptom_mask = person.applicable_symptom_policy_mask;
+    for (size_t i = 0; symptom_mask && i < symptom_policies_.size(); ++i) {
+      if (!(symptom_mask & (1u << i))) continue;
+
+      const auto& policy = symptom_policies_[i];
+      if (!policy.window.contains(current_time)) continue;
+      if (!policy.triggeredBy(current_symptom_id)) continue;
+
+      if (!isParticipating(person.symptom_policy_decisions,
+                           person.active_symptom_policy_participation, i,
+                           policy.action.compliance_rate, person.id,
+                           static_cast<uint32_t>(i))) {
+        continue;
+      }
+
+      if (actionApplies(policy.action, person, activity_index, slotVenueType,
+                        partner)) {
+        return true;
+      }
+    }
+  }
+
+  // Priority 2: temporal policies (lockdowns, etc.)
+  uint32_t temporal_mask = person.applicable_temporal_policy_mask;
+  for (size_t i = 0; temporal_mask && i < temporal_policies_.size(); ++i) {
+    if (!(temporal_mask & (1u << i))) continue;
+
+    const auto& policy = temporal_policies_[i];
+    if (!policy.window.contains(current_time)) continue;
+
+    if (!isParticipating(person.temporal_policy_decisions,
+                         person.active_temporal_policy_participation, i,
+                         policy.action.compliance_rate, person.id,
+                         static_cast<uint32_t>(i + 100))) {
+      continue;
+    }
+
+    if (actionApplies(policy.action, person, activity_index, slotVenueType,
+                      partner)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
 void PolicyManager::precomputePolicyApplicability(std::vector<Person>& people) {
   for (auto& person : people) {
     if (person.is_dead) continue;
@@ -242,16 +326,16 @@ void PolicyManager::precomputePolicyApplicability(std::vector<Person>& people) {
     person.applicable_symptom_policy_mask = 0;
     person.applicable_temporal_policy_mask = 0;
 
-    for (size_t i = 0; i < std::min(symptom_policies_.size(), size_t(32));
-         ++i) {
+    for (size_t i = 0;
+         i < std::min(symptom_policies_.size(), kMaxPoliciesPerKind); ++i) {
       const auto& policy = symptom_policies_[i];
       if (policy.appliesTo(person, &world_)) {
         person.applicable_symptom_policy_mask |= (1u << i);
       }
     }
 
-    for (size_t i = 0; i < std::min(temporal_policies_.size(), size_t(32));
-         ++i) {
+    for (size_t i = 0;
+         i < std::min(temporal_policies_.size(), kMaxPoliciesPerKind); ++i) {
       const auto& policy = temporal_policies_[i];
       if (policy.appliesTo(person, &world_)) {
         person.applicable_temporal_policy_mask |= (1u << i);

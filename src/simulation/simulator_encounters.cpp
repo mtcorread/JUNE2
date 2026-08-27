@@ -4,10 +4,12 @@
 #include <algorithm>
 #include <map>
 #include <set>
+#include <stdexcept>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
+#include "simulation/encounters/eligibility.h"
 #include "simulation/follow_bindings.h"
 #include "simulation/simulator.h"
 #include "utils/deterministic_rng.h"
@@ -17,43 +19,12 @@
 
 namespace june {
 
+using encounters::buildEncounterLookups;
+using encounters::computeLocalEligibility;
+using encounters::EncounterEligibility;
+using encounters::EncounterLookups;
+
 namespace {
-
-// Per-slot lookup tables derived from the coordinated-encounters config:
-// encounter_type_id -> trigger activity indices, and
-// encounter_type_id -> min_attendees threshold.
-struct EncounterLookups {
-  std::unordered_map<uint8_t, std::vector<int16_t>> trigger_activities;
-  std::unordered_map<uint8_t, int> min_attendees;
-};
-
-// Pass-1 result for one daily_encounter: which local participants pass the
-// eligibility checks (alive + not policy-blocked at this slot), how many of
-// them, and the threshold needed before this encounter gets injected.
-struct EncounterEligibility {
-  int encounter_idx;                     // index into daily_encounters
-  std::vector<size_t> eligible_indices;  // local people passing policy
-  int local_eligible;
-  int min_required;
-};
-
-EncounterLookups buildEncounterLookups(
-    const WorldState& world,
-    const std::vector<CoordinatedEncounterDef>& encounters) {
-  EncounterLookups out;
-  for (const auto& def : encounters) {
-    int type_id = world.getEncounterTypeIndex(def.name);
-    if (type_id < 0) continue;
-    std::vector<int16_t> indices;
-    for (const auto& slot_name : def.trigger_slots) {
-      int idx = world.getActivityIndex(slot_name);
-      if (idx >= 0) indices.push_back(static_cast<int16_t>(idx));
-    }
-    out.trigger_activities[static_cast<uint8_t>(type_id)] = std::move(indices);
-    out.min_attendees[static_cast<uint8_t>(type_id)] = def.min_attendees;
-  }
-  return out;
-}
 
 // When both A→B and B→A proposals are accepted in the same slot, two
 // encounters exist for the same pair. Collapse them by keeping the lowest
@@ -84,69 +55,6 @@ std::vector<CoordinatedEncounter> dedupAndSortDailyEncounters(
               return a.encounter_id < b.encounter_id;
             });
   return deduped;
-}
-
-// Pass 1: per-encounter, compute the local participants who survive the
-// alive + policy-block checks. Encounters not scheduled for this slot are
-// skipped. Returned vector is index-aligned with the surviving subset of
-// daily_encounters (each entry stores back into the source via
-// .encounter_idx).
-std::vector<EncounterEligibility> computeLocalEligibility(
-    const std::vector<CoordinatedEncounter>& daily_encounters,
-    int time_slot_index, double current_simulation_time,
-    const std::unordered_map<uint8_t, std::vector<int16_t>>&
-        encounter_trigger_activities,
-    const std::unordered_map<uint8_t, int>& encounter_min_attendees,
-    const WorldState& world, const std::vector<PersonLocation>& locations,
-    PolicyManager* policy_manager) {
-  std::vector<EncounterEligibility> slot_encounters;
-  for (int ei = 0; ei < static_cast<int>(daily_encounters.size()); ++ei) {
-    const auto& enc = daily_encounters[ei];
-    if (enc.slot != time_slot_index) continue;
-
-    auto trig_it = encounter_trigger_activities.find(enc.encounter_type_id);
-
-    std::vector<size_t> eligible_indices;
-    for (PersonId pid : enc.participants) {
-      auto it = world.person_index.find(pid);
-      if (it == world.person_index.end()) continue;
-
-      size_t array_idx = it->second;
-      if (array_idx >= locations.size()) continue;
-
-      const Person& person = world.people[array_idx];
-      if (person.is_dead) continue;
-
-      bool policy_blocked = false;
-      if (policy_manager && trig_it != encounter_trigger_activities.end()) {
-        for (int16_t trigger_act_idx : trig_it->second) {
-          auto override = policy_manager->getOverride(
-              const_cast<Person&>(world.people[array_idx]), trigger_act_idx,
-              locations[array_idx].venue_id, locations[array_idx].subset_index,
-              current_simulation_time, time_slot_index);
-          if (override.has_value()) {
-            policy_blocked = true;
-            break;
-          }
-        }
-      }
-      if (!policy_blocked) eligible_indices.push_back(array_idx);
-    }
-
-    int min_required = 2;
-    auto min_it = encounter_min_attendees.find(enc.encounter_type_id);
-    if (min_it != encounter_min_attendees.end()) {
-      min_required = min_it->second;
-    }
-
-    EncounterEligibility ee;
-    ee.encounter_idx = ei;
-    ee.eligible_indices = std::move(eligible_indices);
-    ee.local_eligible = static_cast<int>(ee.eligible_indices.size());
-    ee.min_required = min_required;
-    slot_encounters.push_back(std::move(ee));
-  }
-  return slot_encounters;
 }
 
 // MPI eligibility exchange. Each rank only knows its local participants'
@@ -249,8 +157,9 @@ void applyEncounterInjection(
     // Register virtual venue ownership so the visitor exchange can route
     // cross-rank encounter participants to the host's rank. Physical
     // venues already have ownership via the venue ownership map; virtual
-    // venues (negative IDs) need explicit registration.
-    if (domain_mgr && enc.venue_id < 0) {
+    // venues need explicit registration. isVirtualVenue, to match the test in
+    // Domain::ownsVenue that reads this registry back.
+    if (domain_mgr && isVirtualVenue(enc.venue_id)) {
       int host_rank = domain_mgr->getPersonRank(enc.host_id);
       domain_mgr->setVenueRank(enc.venue_id, host_rank);
       if (host_rank == domain_mgr->getRank()) {
@@ -376,9 +285,8 @@ void Simulator::injectCoordinatedEncountersIntoSlot(int time_slot_index) {
   // Pass 1: compute each encounter's local eligible-participant set under
   // the alive + policy-block checks.
   std::vector<EncounterEligibility> slot_encounters = computeLocalEligibility(
-      daily_encounters, time_slot_index, current_simulation_time_,
-      lookups.trigger_activities, lookups.min_attendees, world_, locations_,
-      policy_manager_.get());
+      daily_encounters, time_slot_index, current_simulation_time_, lookups,
+      world_, locations_, policy_manager_.get());
 
   // Pass 1.5: in MPI mode, sum local_eligible across ranks for encounters
   // that span ranks so every rank sees the true global count.
@@ -395,10 +303,13 @@ namespace {
 
 // Where a host is this slot, as seen by its followers. activity is the host's
 // resolved activity, used to decide the follower-side activity exception.
+// venue_type travels with the venue because a follower's rank may not hold the
+// host's venue in its own halo and so cannot type it locally.
 struct HostSlot {
   VenueId venue = -1;
   SubsetIndex subset = -1;
   int16_t activity = -1;
+  uint8_t venue_type = kUnknownVenueTypeId;
 };
 
 }  // namespace
@@ -443,6 +354,14 @@ bool venueExcepted(const FollowConfig& fc, uint8_t venue_type) {
 
 bool mirrorSuppressed(const FollowConfig& fc, int16_t host_activity,
                       uint8_t host_venue_type, int16_t follower_activity) {
+  // Every rank types every Venue, and the host is known to have one, so an
+  // unresolvable type here can only be an id naming no Venue at all — a defect
+  // under every configuration, gated rule or not. Unconditional deliberately:
+  // arming it on venue_exceptions would warn a gated rule its world is corrupt
+  // while silently mirroring an ungated follower into an unnameable venue.
+  if (host_venue_type == kUnknownVenueTypeId)
+    throw std::runtime_error(
+        "follow: host venue type is unresolvable at the mirror gate");
   auto listed = [](const auto& ids, auto value) {
     return std::find(ids.begin(), ids.end(), value) != ids.end();
   };
@@ -454,6 +373,19 @@ bool mirrorSuppressed(const FollowConfig& fc, int16_t host_activity,
       listed(fc.follower_activity_exception_ids, follower_activity))
     return true;
   return false;
+}
+
+bool policySuppressesMirror(PolicyManager* policy_manager,
+                            const Person& follower,
+                            int16_t follower_activity_index,
+                            uint8_t host_venue_type, double current_time) {
+  if (!policy_manager) return false;
+  // known(), not fromVenue(): the host's type travelled with its venue, so no
+  // local lookup is needed and none would succeed for a cross-rank host. A host
+  // only enters host_loc with a venue, so the type is never absent here.
+  return policy_manager->suppressesParticipation(
+      follower, follower_activity_index, SlotVenueType::known(host_venue_type),
+      current_time);
 }
 
 // The host's candidate pool: co-members of its venue of the configured type, or
@@ -717,6 +649,11 @@ void activateRemoteCriteriaHosts(
 // travels too so the activity exception works cross-rank. Sending only the
 // slot-active hosts (not every enrolled host) keeps an off-hop host from being
 // mirrored on a hop span.
+//
+// Ints per host on the wire. Shared by the packer, the bounds guard and the
+// unpack stride so the two halves cannot drift.
+constexpr size_t kHostLocationInts = 5;
+
 void broadcastHostLocations(WorldState& world,
                             const std::vector<PersonLocation>& locations,
                             std::unordered_map<PersonId, HostSlot>& host_loc,
@@ -730,15 +667,28 @@ void broadcastHostLocations(WorldState& world,
     local.push_back(static_cast<int>(hl.venue_id));
     local.push_back(static_cast<int>(hl.subset_index));
     local.push_back(static_cast<int>(hl.activity_index));
+    local.push_back(static_cast<int>(world.getVenueTypeId(hl.venue_id)));
   }
   std::vector<int> all = allgathervInts(local);
-  for (size_t i = 0; i + 4 <= all.size(); i += 4) {
+  for (size_t i = 0; i + kHostLocationInts <= all.size();
+       i += kHostLocationInts) {
     PersonId h = all[i];
     VenueId v = all[i + 1];
     SubsetIndex s = all[i + 2];
     int16_t act = static_cast<int16_t>(all[i + 3]);
+    uint8_t venue_type = static_cast<uint8_t>(all[i + 4]);
     active_now.insert(h);
-    if (v >= 0) host_loc[h] = {v, s, act};
+    if (v < 0) continue;
+    // The sender typed this venue against its own all-venue type map, and the
+    // v < 0 check above has already excluded venue-less hosts, so an unknown
+    // type arriving here means the wire and the sender's venue registry have
+    // diverged.
+    if (venue_type == kUnknownVenueTypeId)
+      throw std::runtime_error(
+          "follow: host " + std::to_string(h) +
+          " was broadcast with an unresolvable venue type for venue " +
+          std::to_string(v));
+    host_loc[h] = {v, s, act, venue_type};
   }
 }
 #endif  // USE_MPI
@@ -904,7 +854,8 @@ void Simulator::processFollowRule(
     active_now.insert(*it);
     const PersonLocation& hl = locations_[hi->second];
     if (hl.venue_id >= 0)
-      host_loc[*it] = {hl.venue_id, hl.subset_index, hl.activity_index};
+      host_loc[*it] = {hl.venue_id, hl.subset_index, hl.activity_index,
+                       world_.getVenueTypeId(hl.venue_id)};
     ++it;
   }
 #ifdef USE_MPI
@@ -933,18 +884,23 @@ void Simulator::processFollowRule(
     if (hl == host_loc.end()) continue;  // host active but no venue this slot
 
     PersonLocation& floc = locations_[fi->second];
-    const uint8_t host_venue_type = world_.getVenueTypeId(hl->second.venue);
+    // Off the wire, not a local lookup: a cross-rank host's venue is outside
+    // this rank's halo and would type as unresolvable here.
+    const uint8_t host_venue_type = hl->second.venue_type;
     if (follow_detail::mirrorSuppressed(fc, hl->second.activity,
                                         host_venue_type, floc.activity_index))
       continue;
     // The follower's own policy wins. If a policy would move them (sick and
-    // sent home, say), leave them where the policy put them.
-    if (policy_manager_ &&
-        policy_manager_
-            ->getOverride(world_.people[fi->second], floc.activity_index,
-                          floc.venue_id, floc.subset_index,
-                          current_simulation_time_, time_slot_index)
-            .has_value())
+    // sent home, say), decline the mirror and leave them on their own
+    // schedule — ActivityManager has already placed them, and declining to
+    // mirror moves nobody anywhere. The question is asked about the host's
+    // venue type, since that is where the mirror is about to put them; a
+    // venue-gated policy asked about their own venue would miss. Only the
+    // named leg is gated — a partial-presence host's other legs are handled by
+    // the venue exceptions below.
+    if (follow_detail::policySuppressesMirror(
+            policy_manager_.get(), world_.people[fi->second],
+            floc.activity_index, host_venue_type, current_simulation_time_))
       continue;
 
     // Travelling with the host means riding the host's whole journey, not the

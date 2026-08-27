@@ -20,10 +20,22 @@ policies:
   symptom_policies:
 
     # -------------------------------------------------------------------------
-    # Policy: Mild/Severe symptoms → Stay at residence
+    # 12 Mar 2020 (day 40) - "contain" becomes "delay". Anyone with a new
+    # continuous cough or fever is told to self-isolate for 7 days. There is
+    # deliberately no policy before this date: symptomatic people behaved
+    # normally through February, which is what the timeline says happened.
+    #
+    # The window closes on 16 Mar, when household isolation supersedes it. The
+    # follow-up chain mild -> severe lives entirely inside this window: a
+    # closing window is a change of government instruction, not symptom
+    # progression, so nothing is inherited across the 16 Mar edge. Compliance
+    # is re-rolled against the superseding policy's own rate.
     # -------------------------------------------------------------------------
 
     - name: "isolate_when_mild"
+
+      start_date: "2020-03-12"
+      end_date: "2020-03-16"
 
       # Symptoms that trigger this policy
       symptoms: ["mild"]
@@ -42,35 +54,70 @@ policies:
       inherit_compliance: true
       inherit_refusal: false # Let them change their mind for severe symptoms
 
-      # Optional: Only apply to certain people (using selection criteria)
-      # applies_to:
-      #   - property: "age"
-      #     operator: "<"
-      #     value: 65
-
     - name: "isolate_when_severe"
 
-      # Symptoms that trigger this policy
+      start_date: "2020-03-12"
+      end_date: "2020-03-16"
+
       symptoms: ["severe"]
 
-      # Override these activities when symptoms trigger
-      # Options: List of activity names, or "*" for all activities
       override_activities: ["primary_activity", "leisure"]
 
-      # Replace with this activity
       replacement: "residence"
 
       compliance_rate: 0.8
 
-      # Optional: Only apply to certain people (using selection criteria)
-      # applies_to:
-      #   - property: "age"
-      #     operator: "<"
-      #     value: 65
+    # -------------------------------------------------------------------------
+    # 16 Mar 2020 (day 44) - household isolation. The whole household of a
+    # symptomatic person is told to stay at home for 14 days.
+    #
+    # A SymptomPolicy acts on the person carrying the symptom, so the
+    # household members are not themselves confined here - what the stronger
+    # instruction buys is a higher compliance rate for the symptomatic person.
+    # Confining well household members would need a policy trigger keyed on a
+    # housemate's symptoms, which the engine does not have.
+    #
+    # No end_date: the measure runs to the end of the simulated period. The
+    # mild -> severe follow-up chain is declared again inside this window, so
+    # symptom progression on or after 16 Mar inherits within the window.
+    # -------------------------------------------------------------------------
+
+    - name: "isolate_household_when_mild"
+
+      start_date: "2020-03-16"
+
+      symptoms: ["mild"]
+
+      override_activities: ["primary_activity", "leisure"]
+
+      replacement: "residence"
+
+      # Placeholder rates: household isolation was a firmer instruction than
+      # the 12 Mar advice, so compliance is higher. Fit against data before
+      # drawing conclusions from a run.
+      compliance_rate: 0.7
+
+      follow_up_policy: "isolate_household_when_severe"
+      inherit_compliance: true
+      inherit_refusal: false
+
+    - name: "isolate_household_when_severe"
+
+      start_date: "2020-03-16"
+
+      symptoms: ["severe"]
+
+      override_activities: ["primary_activity", "leisure"]
+
+      replacement: "residence"
+
+      compliance_rate: 0.9
 
     # -------------------------------------------------------------------------
-    # Policy: Hospitalized → Go to medical facility
+    # Policy: Hospitalized -> Go to medical facility
     # -------------------------------------------------------------------------
+    # Undated: hospitalisation is clinical care, not an intervention of the
+    # period, so it is in force for the whole run.
     - name: "hospitalize_severe_cases"
 
       symptoms: ["hospitalised", "intensive_care"]

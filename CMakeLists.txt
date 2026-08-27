@@ -126,6 +126,9 @@ endif()
 # ==============================================================================
 set(JUNE_CORE_SOURCES
     src/epidemiology/infection_seed.cpp
+    src/epidemiology/seeding/seed_selector.cpp
+    src/epidemiology/seeding/seed_shortfall.cpp
+    src/epidemiology/seeding/seed_cluster_planner.cpp
     src/epidemiology/disease.cpp
     src/loaders/disease_loader.cpp
     src/interaction/interaction_manager.cpp
@@ -147,6 +150,7 @@ set(JUNE_CORE_SOURCES
     src/utils/filtered_csv.cpp
     src/utils/event_logging/event_writer.cpp
     src/utils/event_logging/event_writer_lookups.cpp
+    src/utils/mpi_logging.cpp
     src/utils/event_logging/event_merger.cpp
     src/utils/event_logging/event_merger_lookups.cpp
     src/epidemiology/epidemiology.cpp
@@ -155,6 +159,7 @@ set(JUNE_CORE_SOURCES
     src/loaders/calendar_event_loader.cpp
     src/loaders/catchment_rule_loader.cpp
     src/simulation/simulator.cpp
+    src/simulation/encounters/eligibility.cpp
     src/simulation/simulator_checkpoint.cpp
     src/simulation/simulator_encounters.cpp
     src/simulation/simulator_reporting.cpp
@@ -172,6 +177,7 @@ if(MPI_FOUND)
   list(APPEND JUNE_CORE_SOURCES
        src/parallel/domain.cpp
        src/parallel/domain_manager.cpp
+       src/parallel/seed_offer_exchange_mpi.cpp
        src/parallel/geography_partitioner.cpp
        src/parallel/domain_communicator.cpp
        src/parallel/domain_communicator_encounters.cpp)
@@ -293,6 +299,8 @@ if(BUILD_TESTING)
   add_june_test(test_domain_communicator_detail "tests/test_domain_communicator_detail.cpp")
   add_june_test(test_run_dir "tests/test_run_dir.cpp")
   add_june_test(test_world_state "tests/test_world_state.cpp")
+  add_june_test(test_selection_criterion_geography "tests/test_selection_criterion_geography.cpp")
+  add_june_test(test_domain_loader_internals "tests/test_domain_loader_internals.cpp")
   add_june_test(test_infection "tests/test_infection.cpp;src/loaders/disease_loader.cpp")
   add_june_test(test_transmission_lookups "tests/test_transmission_lookups.cpp")
   add_june_test(test_coordinated_encounters "tests/test_coordinated_encounters.cpp")
@@ -308,6 +316,7 @@ if(BUILD_TESTING)
   add_june_test(test_config_loading "tests/test_config_loading.cpp")
   add_june_test(test_config_checks "tests/test_config_checks.cpp")
   add_june_test(test_activity_manager "tests/test_activity_manager.cpp")
+  add_june_test(test_policy "tests/test_policy.cpp")
   add_june_test(test_on_the_fly_venue_allocator "tests/test_on_the_fly_venue_allocator.cpp")
   add_june_test(test_schedule_csv "tests/test_schedule_csv.cpp")
   add_june_test(test_day_types "tests/test_day_types.cpp")
@@ -318,6 +327,10 @@ if(BUILD_TESTING)
   add_june_test(test_calendar_event_venue      "tests/test_calendar_event_venue.cpp")
   add_june_test(test_calendar_event_checkpoint "tests/test_calendar_event_checkpoint.cpp")
   add_june_test(test_catchment_rule_loader "tests/test_catchment_rule_loader.cpp")
+  add_june_test(test_infection_seed_loader "tests/test_infection_seed_loader.cpp")
+  add_june_test(test_seed_selector "tests/test_seed_selector.cpp")
+  add_june_test(test_seed_shortfall "tests/test_seed_shortfall.cpp")
+  add_june_test(test_seed_cluster_planner "tests/test_seed_cluster_planner.cpp")
   add_june_test(test_cross_domain_venues "tests/test_cross_domain_venues.cpp")
   add_june_test(test_membership_metadata_matching "tests/test_membership_metadata_matching.cpp")
   add_june_test(test_integration "tests/test_integration.cpp;src/loaders/disease_loader.cpp")
@@ -361,7 +374,19 @@ if(BUILD_TESTING)
                WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
       set_tests_properties(test_mpi_full_reproducibility PROPERTIES
                            ENVIRONMENT "BUILD_DIR=${CMAKE_CURRENT_BINARY_DIR};DAYS=5"
-                           TIMEOUT 600)
+                           SKIP_RETURN_CODE 77 TIMEOUT 600)
+
+      # The same end-to-end diff, seeded structurally above the partition
+      # level (an exact seed in an LGU and in an XLGU, MGU being where
+      # parallel.yaml partitions). A structured seed states an absolute
+      # count, so this is what catches a unit being seeded once per rank
+      # covering it.
+      add_test(NAME test_mpi_structured_seed_reproducibility
+               COMMAND ${CMAKE_SOURCE_DIR}/tests/test_mpi_full_reproducibility.sh
+               WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+      set_tests_properties(test_mpi_structured_seed_reproducibility PROPERTIES
+                           ENVIRONMENT "BUILD_DIR=${CMAKE_CURRENT_BINARY_DIR};DAYS=3;SEEDS=configs/config_2021/infection_seeds_structured.yaml"
+                           SKIP_RETURN_CODE 77 TIMEOUT 600)
 
       # Checkpoint/restart determinism gate: a checkpoint leg + resume leg
       # must be set-identical to an uninterrupted baseline across a

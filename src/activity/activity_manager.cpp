@@ -103,11 +103,12 @@ void ActivityManager::setDeadLocation(PersonLocation& loc) const {
 bool ActivityManager::applyPolicyOverride(PersonLocation& loc, Person& person,
                                           int16_t activity, VenueId venue,
                                           SubsetIndex subset,
+                                          SlotVenueType slot_venue_type,
                                           int time_slot_index) {
   if (policy_manager_ == nullptr) return false;
-  auto override =
-      policy_manager_->getOverride(person, activity, venue, subset,
-                                   current_simulation_time_, time_slot_index);
+  auto override = policy_manager_->getOverride(
+      person, activity, venue, subset, slot_venue_type,
+      current_simulation_time_, time_slot_index);
   if (!override.has_value()) return false;
   loc = override.value();
   return true;
@@ -271,9 +272,10 @@ void ActivityManager::assignSingleSlotForLivePerson(
   locations[i].person_array_index = i;
 
   // Check for policy overrides (symptom-based, lockdowns, etc.)
-  if (applyPolicyOverride(locations[i], const_cast<Person&>(person),
-                          scheduled_activity_index, locations[i].venue_id,
-                          locations[i].subset_index, -1)) {
+  if (applyPolicyOverride(
+          locations[i], const_cast<Person&>(person), scheduled_activity_index,
+          locations[i].venue_id, locations[i].subset_index,
+          SlotVenueType::fromVenue(locations[i].venue_id), -1)) {
     locations[i].person_id = person.id;
     locations[i].person_array_index = i;
   }
@@ -431,6 +433,7 @@ void ActivityManager::resolveAndWriteValidScheduleSlot(
   // Check for policy overrides (symptom-based, lockdowns, etc.)
   if (applyPolicyOverride(locations[i], person, scheduled_activity_index,
                           scheduled_venue_id, scheduled_subset_idx,
+                          SlotVenueType::fromVenue(scheduled_venue_id),
                           time_slot_index)) {
     return;
   }
@@ -666,6 +669,10 @@ void ActivityManager::assignHoppedSingleSlot(
   }
 
   if (policy_manager_ != nullptr) {
+    // The substituted venue is a pin, not a gate key: a traveller in no_venue
+    // transit occupies no venue this slot, whatever they are pinned to.
+    const SlotVenueType slot_venue_type =
+        SlotVenueType::fromVenue(locations[i].venue_id);
     VenueId effective_venue = locations[i].venue_id;
     SubsetIndex effective_subset = locations[i].subset_index;
     if (effective_venue < 0 && hopped_sched.is_temporary) {
@@ -675,7 +682,7 @@ void ActivityManager::assignHoppedSingleSlot(
     }
     applyPolicyOverride(locations[i], mutable_person,
                         locations[i].activity_index, effective_venue,
-                        effective_subset, -1);
+                        effective_subset, slot_venue_type, -1);
   }
 
   locations[i].person_id = person.id;
@@ -715,6 +722,10 @@ void ActivityManager::assignHoppedScheduleSlot(
 
   // Apply policy overrides (e.g. sick traveller freeze / unfreeze)
   if (policy_manager_ != nullptr) {
+    // Read before the substitution below: that venue is the pin, this is the
+    // venue the person actually occupies this slot.
+    const SlotVenueType slot_venue_type =
+        SlotVenueType::fromVenue(locations[i].venue_id);
     VenueId effective_venue = locations[i].venue_id;
     SubsetIndex effective_subset = locations[i].subset_index;
     // If in transit (no_venue), resolve last real overnight venue so the
@@ -725,7 +736,8 @@ void ActivityManager::assignHoppedScheduleSlot(
       effective_subset = ls;
     }
     applyPolicyOverride(locations[i], person, locations[i].activity_index,
-                        effective_venue, effective_subset, time_slot_index);
+                        effective_venue, effective_subset, slot_venue_type,
+                        time_slot_index);
   }
 
   locations[i].person_id = person.id;

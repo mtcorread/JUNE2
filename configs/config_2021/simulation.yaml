@@ -1,6 +1,10 @@
 time:
-    start_date : "2024-01-01"
-    end_date : "2024-07-01"
+    # The COVID-19 UK timeline this config reproduces. End date is exclusive,
+    # so the run covers 1 Feb 2020 through 31 Jul 2020. 12 Mar 2020 (the
+    # "contain" -> "delay" switch) is day 40; 16 Mar 2020 (household
+    # isolation) is day 44.
+    start_date : "2020-02-01"
+    end_date : "2020-08-01"
 
 config_paths:
 # Configuration paths
@@ -60,5 +64,5 @@ checkpoint:
     enabled: true
     output_dir: checkpoints/
     every_n_days: null          # checkpoint weekly; ignored if on_dates is set
-    on_dates: ["2024-02-05"]           # or a list, e.g. ["2024-01-10", "2024-01-20"]
+    on_dates: ["2020-03-12"]           # or a list, e.g. ["2020-03-12", "2020-03-16"]
     keep_last: 3             # 0 = keep all

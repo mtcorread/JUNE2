@@ -21,6 +21,9 @@
 #include "epidemiology/infection_seed.h"
 #include "epidemiology/interaction_manager.h"
 #include "epidemiology/policy.h"
+#ifdef USE_MPI
+#include "parallel/seed_offer_exchange_mpi.h"
+#endif
 #include "epidemiology/vaccination_manager.h"
 #include "loaders/disease_loader.h"
 #include "loaders/policy_loader.h"
@@ -80,6 +83,9 @@ class Simulator {
   // Disease and infection management
   std::unique_ptr<Disease> disease_;
   std::unique_ptr<InfectionSeeder> infection_seeder_;
+#ifdef USE_MPI
+  MpiSeedOfferExchange seed_offer_exchange_;
+#endif
 
   // Calendar event management (no-op when no CSV paths are configured)
   CalendarEventManager calendar_event_manager_;

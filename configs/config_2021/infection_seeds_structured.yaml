@@ -1,0 +1,64 @@
+# Structured seeding variant of infection_seeds.yaml, used by
+# tests/test_mpi_full_reproducibility.sh (SEEDS=...) to check that a
+# structured seed places its stated total once, at any rank count.
+#
+# Every seed sits ABOVE the MGU partition level of parallel.yaml, so every
+# rank covering the unit sees part of it — the case the seeder must get right.
+
+global_parameters:
+  default_seed_strength: 1.0
+  base_cases_per_capita: 0.0002
+
+infection_seeds:
+  # One level above the partition: per-group counts.
+  - name: "lgu_exact_seeding"
+    type: "exact"
+    date: "2020-02-01 08:00"
+    geo_level: "LGU"
+    parameters:
+      age_groups: ["0-17", "18-64", "65-120"]
+      units:
+        "Darlington": [5, 10, 2]
+
+  # Two levels above the partition: one total, no demographic restriction.
+  - name: "xlgu_exact_seeding"
+    type: "exact"
+    date: "2020-02-02 08:00"
+    geo_level: "XLGU"
+    parameters:
+      units:
+        "North East": 20
+
+  # Overlapping bands, deliberately: everyone in "0-17" is also in "0-64", so
+  # the two budgets compete for the same people, and a person winning both
+  # would leave one budget short. Both must still fill, at any rank count.
+  # The counts are large on purpose: a candidate wins two budgets about
+  # cases_a * cases_b / |wider band| times, so small budgets would almost
+  # never exercise the contest.
+  - name: "lgu_overlapping_exact_seeding"
+    type: "exact"
+    date: "2020-02-03 08:00"
+    geo_level: "LGU"
+    parameters:
+      age_groups: ["0-17", "0-64"]
+      units:
+        "Darlington": [500, 2000]
+
+  # Clustered: the same absolute count, placed household by household.
+  - name: "lgu_clustered_seeding"
+    type: "clustered"
+    date: "2020-02-03 08:00"
+    geo_level: "LGU"
+    parameters:
+      age_groups: ["0-17", "18-64", "65-120"]
+      units:
+        "Darlington": [4, 8, 3]
+
+  # Clustered, two levels above the partition, one total across everyone.
+  - name: "xlgu_clustered_seeding"
+    type: "clustered"
+    date: "2020-02-03 08:00"
+    geo_level: "XLGU"
+    parameters:
+      units:
+        "North East": 15

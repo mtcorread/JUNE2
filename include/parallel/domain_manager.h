@@ -87,14 +87,14 @@ class DomainManager {
     global_venue_rank_[vid] = rank;
   }  // For tests
 
-  // Clear virtual venue entries (id <= -1000) from the rank map.
+  // Clear virtual venue entries from the rank map.
   // Called each time slot alongside Domain::clearVirtualVenues() so that
   // stale virtual venue assignments don't prevent re-registration when
   // a new encounter reuses the same hash-derived venue ID.
   void clearVirtualVenueRanks() {
     for (auto it = global_venue_rank_.begin();
          it != global_venue_rank_.end();) {
-      if (it->first <= -1000)
+      if (isVirtualVenue(it->first))
         it = global_venue_rank_.erase(it);
       else
         ++it;

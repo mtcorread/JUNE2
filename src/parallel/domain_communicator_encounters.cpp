@@ -549,13 +549,12 @@ std::optional<PendingInfection> DomainCommunicator::applyOnePendingInfection(
   if (gu) severity_factor = gu->severity_factor;
 
   // venue_key consistent with the local infection path
-  // (interaction_manager.cpp): for virtual venues (id <= -1000), extract
-  // the host's person_id so the infection seed is deterministic
-  // regardless of which rank creates it.
+  // (interaction_manager.cpp): for a virtual venue, key on the host's
+  // person_id so the infection seed is the same regardless of which rank
+  // creates it.
   uint64_t venue_key = static_cast<uint64_t>(pending.venue_id);
-  if (pending.venue_id <= -1000) {
-    venue_key =
-        static_cast<uint64_t>(-static_cast<int64_t>(pending.venue_id) - 1000);
+  if (isVirtualVenue(pending.venue_id)) {
+    venue_key = static_cast<uint64_t>(virtualVenueHost(pending.venue_id));
   }
   uint64_t infection_seed =
       mix_seed(config_.simulation.random_seed, pending.person_id,

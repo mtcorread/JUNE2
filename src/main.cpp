@@ -66,7 +66,9 @@ void printExamplePeople(const WorldState& world, size_t count = 5) {
                 using T = std::decay_t<decltype(arg)>;
                 if constexpr (std::is_same_v<T, std::monostate>) {
                   std::cout << "null";
-                } else if constexpr (std::is_same_v<T, std::vector<int32_t>>) {
+                } else if constexpr (std::is_same_v<T, std::vector<int32_t>> ||
+                                     std::is_same_v<T,
+                                                    std::vector<std::string>>) {
                   std::cout << "[" << arg.size() << " items]";
                 } else {
                   std::cout << arg;
@@ -639,15 +641,17 @@ int main(int argc, char* argv[]) {
                                                         e.getDetailMsg());
       }
     } else {
-      std::cerr << "[Rank " << rank << "] HDF5 error: " << e.getCDetailMsg()
-                << std::endl;
+      std::cerr << "[Rank " << rank
+                << "] FATAL: HDF5 error: " << e.getCDetailMsg() << std::endl;
     }
 #ifdef USE_MPI
     MPI_Abort(MPI_COMM_WORLD, 1);
 #endif
     return 1;
   } catch (std::exception& e) {
-    std::cerr << "[Rank " << rank << "] Error: " << e.what() << std::endl;
+    // FATAL, not Error: this handler is unconditionally followed by MPI_Abort,
+    // so everything it prints ends the run for every rank.
+    std::cerr << "[Rank " << rank << "] FATAL: " << e.what() << std::endl;
 #ifdef USE_MPI
     MPI_Abort(MPI_COMM_WORLD, 1);
 #endif

@@ -101,7 +101,7 @@ class Domain {
   void clearVirtualVenues() { virtual_venue_set.clear(); }
 
   bool ownsVenue(VenueId id) const {
-    if (id <= -1000) {
+    if (isVirtualVenue(id)) {
       // Check dynamic registry (set during encounter injection)
       return virtual_venue_set.count(id) > 0;
     }
@@ -114,7 +114,8 @@ class Domain {
     geo_unit_set.insert(id);
   }
 
-  // Assign people and venues based on geo unit ownership
+  // Assign people and venues based on geo unit ownership. Throws if the world
+  // breaks the geo unit locality of residence: see checkResidencesAreLocal.
   void assignPeopleAndVenues();
 
   // Visitor management
@@ -133,6 +134,13 @@ class Domain {
 
   // Print domain statistics
   void printStatistics() const;
+
+ private:
+  // A residence venue and its occupants share a geo unit, so a household is
+  // held whole by one rank. The partition assumes it, and clustered seeding's
+  // local density truncation is exact only under it. See ADR 0012. Throws
+  // naming the offenders rather than running on a world that breaks it.
+  void checkResidencesAreLocal() const;
 };
 
 }  // namespace june

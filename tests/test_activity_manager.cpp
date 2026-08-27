@@ -257,8 +257,8 @@ TEST_CASE("ActivityManager - PolicyManager Override") {
 
   TemporalPolicy lockdown;
   lockdown.name = "Lockdown";
-  lockdown.start_time = 0.0;
-  lockdown.end_time = 10.0;
+  lockdown.window.start_time = 0.0;
+  lockdown.window.end_time = 10.0;
   lockdown.action.override_activities.insert("work");
   lockdown.action.replacement_activity = "residence";
   lockdown.action.compliance_rate = 1.0;

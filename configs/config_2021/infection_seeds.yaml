@@ -9,7 +9,7 @@ infection_seeds:
   # Single uniform seeding event
   - name: "basic_seeding"
     type: "uniform"
-    date: "2024-01-01 08:00"
+    date: "2020-02-01 08:00"
     parameters:
       cases_per_capita_multiplier: 15.0
 
@@ -38,11 +38,17 @@ infection_seeds:
 #     date: "2024-01-02 12:00"
 #     geo_level: "MGU" # Geographic level for 'units'
 #     parameters:
-#       # Filter for demographic groups (Target Groups)
-#       age_groups: ["0-17", "18-64", "65+"] 
-      
+#       # Filter for demographic groups (Target Groups). Omit age_groups
+#       # entirely and a count draws from anyone eligible in the unit.
+#       # Each band must be a closed "min-max" range: an open band such as
+#       # "65+" is read as an exact age value, matches nobody, and seeds
+#       # nothing.
+#       age_groups: ["0-17", "18-64", "65-120"]
+
 #       # units: "unit_id": [cases_per_group_1, cases_per_group_2, ...]
-#       # Or "unit_id": total_cases (distributed across groups)
+#       #   one count per declared age group; a length mismatch is fatal at load.
+#       # Or "unit_id": total_cases
+#       #   a single total, drawn from anyone matching any declared age group.
 #       units:
 #         "E02004292": [5, 10, 2] # 5 kids, 10 adults, 2 seniors
 #         "E02001234": 20        # 20 people total, matching any age group

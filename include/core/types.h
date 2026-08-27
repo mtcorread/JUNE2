@@ -78,6 +78,40 @@ struct VisitorInfo {
 // Special venue ID for infection seed events
 constexpr VenueId INFECTION_SEED_VENUE_ID = -999;
 
+// -----------------------------------------------------------------------------
+// The virtual-venue id range
+// -----------------------------------------------------------------------------
+// A Virtual Encounter is held at no Venue, but still needs an identity for
+// interaction grouping, MPI venue ownership and infection seeding. It borrows a
+// reserved negative range of VenueId that encodes its host:
+//
+//     id = kVirtualVenueIdBase - host_id     (host_id >= 0)
+//
+// The range is the identity, not a sentinel — each host's virtual venue is
+// distinct, which keeps two hosts' encounters in separate interaction groups,
+// lets each rank claim only the virtual venues it hosts, and gives every
+// encounter its own RNG stream. This is the only place the encoding is spelled
+// out; no call site writes -1000 or a bare sign test.
+constexpr VenueId kVirtualVenueIdBase = -1000;
+
+constexpr VenueId makeVirtualVenueId(PersonId host_id) {
+  return kVirtualVenueIdBase - host_id;
+}
+
+// True for the reserved virtual-encounter range only. Deliberately excludes the
+// other negative VenueIds — kInvalidVenueId (-1) and INFECTION_SEED_VENUE_ID
+// (-999) are not virtual venues.
+constexpr bool isVirtualVenue(VenueId id) { return id <= kVirtualVenueIdBase; }
+
+constexpr PersonId virtualVenueHost(VenueId id) {
+  return static_cast<PersonId>(kVirtualVenueIdBase - id);
+}
+
+// "Has no parent Venue" — every negative VenueId, virtual or otherwise. A
+// separate predicate from isVirtualVenue because some readers mean this
+// weaker question.
+constexpr bool occupiesNoVenue(VenueId id) { return id < 0; }
+
 // =============================================================================
 // GeographicalUnit - Represents a geographical region (SGU, MGU, LGU, etc.)
 // =============================================================================

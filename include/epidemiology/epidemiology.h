@@ -12,6 +12,8 @@
 
 namespace june {
 
+class PolicyManager;
+
 struct EpiSlotStats {
   int transitions = 0;
   int recoveries = 0;
@@ -32,6 +34,13 @@ class Epidemiology {
 
   // Apply decay to venue fomite loads based on time elapsed
   void updateVenueFomites(double current_simulation_time, double delta_hours);
+
+  // Recovery and death end any policy freeze the person is under, so
+  // Epidemiology needs the manager holding it. Absent (tests that run no
+  // policies), nothing is released.
+  void setPolicyManager(PolicyManager* policy_manager) {
+    policy_manager_ = policy_manager;
+  }
 
   // Track a newly infected person
   void trackInfection(PersonId pid);
@@ -74,6 +83,7 @@ class Epidemiology {
   WorldState& world_;
   const Disease* disease_;
   EventLogger* event_logger_;
+  PolicyManager* policy_manager_ = nullptr;
 
   // Only track people who are currently infected
   std::unordered_set<PersonId> active_infections_;

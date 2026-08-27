@@ -13,7 +13,8 @@ using PropertyValue =
                  int32_t,              // Integer
                  double,               // Double
                  std::string,          // String
-                 std::vector<int32_t>  // List of ints (e.g., social_contacts)
+                 std::vector<int32_t>,     // List of ints (e.g. social_contacts)
+                 std::vector<std::string>  // List of strings (e.g. unit names)
                  >;
 
 // Helper functions for PropertyValue
