@@ -9,7 +9,7 @@ infection_seeds:
   # Single uniform seeding event
   - name: "basic_seeding"
     type: "uniform"
-    date: "2024-01-01 08:00"
+    date: "2020-02-01 08:00"
     parameters:
       cases_per_capita_multiplier: 15.0
 

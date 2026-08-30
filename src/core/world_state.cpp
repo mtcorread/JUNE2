@@ -35,8 +35,10 @@ void WorldState::buildIndices() {
   }
 
   people_by_geo_unit.clear();
+  directly_inhabited_geo_units.clear();
   for (size_t i = 0; i < people.size(); ++i) {
     GeoUnitId current_id = people[i].geo_unit_id;
+    if (current_id != -1) directly_inhabited_geo_units.insert(current_id);
     while (current_id != -1) {
       people_by_geo_unit[current_id].push_back(i);
 

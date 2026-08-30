@@ -645,6 +645,49 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "2a2. mode-only virtual contact matrix resolves "
+    "[Regression PR25]") {
+  auto tw = buildEncounterWorld(
+      2, 0, "pub", "friendships", "romantic_encounters", true,
+      "romantic_encounter", {"leisure"},
+      InviteDistribution{DistributionType::FIXED, 1.0, 0.5, 1}, 1.0, 1.0);
+  addScheduleToAll(tw, "open", {{"all_day", {"leisure", "residence"}}});
+
+  tw.config.contact_matrices.matrices.erase("romantic_encounter");
+  tw.config.contact_matrices
+      .mode_matrices["romantic_encounter"]["respiratory"] = ContactMatrix();
+  tw.config.contact_matrices
+      .mode_matrices["romantic_encounter"]["physical_contact"] =
+      ContactMatrix();
+  tw.config.resolve(tw.world);
+
+  const auto& def = tw.config.coordinated_encounters.encounters.front();
+  INFO("mode-only virtual matrix index: " << def.cached_virtual_venue_type_id);
+  INFO("matrix-name index contains romantic_encounter: "
+       << (tw.config.contact_matrices.matrix_name_to_id.count(
+               "romantic_encounter") != 0));
+  REQUIRE(def.cached_virtual_venue_type_id != kUnknownVenueTypeId);
+
+  CoordinatedEncounterManager cem(tw.world, tw.config, 0);
+  std::vector<EncounterProposal> proposals;
+  cem.generateProposals(0, proposals, 0);
+  INFO("generated proposals: " << proposals.size());
+  REQUIRE(proposals.size() > 0);
+
+  std::vector<EncounterReply> replies;
+  cem.processProposals(proposals, proposals, replies, 0);
+  INFO("accepted proposals: " << std::count_if(replies.begin(), replies.end(),
+                                               [](const auto& reply) {
+                                                 return reply.status ==
+                                                        ReplyStatus::ACCEPTED;
+                                               })
+                              << " / " << replies.size());
+  CHECK(std::count_if(replies.begin(), replies.end(), [](const auto& reply) {
+          return reply.status == ReplyStatus::ACCEPTED;
+        }) > 0);
+}
+
+TEST_CASE(
     "2b. processProposals — Physical venue type matches encounter def, "
     "not classroom [Regression Bug #3]") {
   /**
@@ -1567,8 +1610,8 @@ static void addLockdownPolicy(
     const std::vector<ActivityExemption>& exemptions = {}) {
   TemporalPolicy tp;
   tp.name = "test_lockdown";
-  tp.start_time = start_time;
-  tp.end_time = end_time;
+  tp.window.start_time = start_time;
+  tp.window.end_time = end_time;
 
   tp.action.override_all = true;
   tp.action.replacement_activity = "residence";
@@ -1595,12 +1638,11 @@ static std::unique_ptr<Disease> addVenueGatedPolicy(
     double end_time) {
   TemporalPolicy tp;
   tp.name = "close_pubs";
-  tp.start_time = start_time;
-  tp.end_time = end_time;
+  tp.window.start_time = start_time;
+  tp.window.end_time = end_time;
 
   tp.action.override_activities.insert(activities.begin(), activities.end());
-  tp.action.override_venue_types.insert(venue_types.begin(),
-                                        venue_types.end());
+  tp.action.override_venue_types.insert(venue_types.begin(), venue_types.end());
   tp.action.replacement_activity = "residence";
   tp.action.replacement_activity_index =
       static_cast<int16_t>(world.getActivityIndex("residence"));
@@ -2097,8 +2139,8 @@ TEST_CASE("7g. Venue gate — encounter at a gated pub is cancelled") {
       InviteDistribution{DistributionType::FIXED, 1.0, 0.5, 1}, 1.0, 1.0);
 
   PolicyManager pm(tw.world);
-  auto disease = addVenueGatedPolicy(pm, tw.world, {"leisure"}, {"pub"}, 0.0,
-                                     10.0);
+  auto disease =
+      addVenueGatedPolicy(pm, tw.world, {"leisure"}, {"pub"}, 0.0, 10.0);
 
   tw.world.people[0].applicable_temporal_policy_mask = 1;
   tw.world.people[1].applicable_temporal_policy_mask = 1;
@@ -2136,8 +2178,8 @@ TEST_CASE("7h. Venue gate — same policy, encounter at an ungated venue fires")
       InviteDistribution{DistributionType::FIXED, 1.0, 0.5, 1}, 1.0, 1.0);
 
   PolicyManager pm(tw.world);
-  auto disease = addVenueGatedPolicy(pm, tw.world, {"leisure"}, {"pub"}, 0.0,
-                                     10.0);
+  auto disease =
+      addVenueGatedPolicy(pm, tw.world, {"leisure"}, {"pub"}, 0.0, 10.0);
 
   tw.world.people[0].applicable_temporal_policy_mask = 1;
   tw.world.people[1].applicable_temporal_policy_mask = 1;
@@ -2173,8 +2215,7 @@ TEST_CASE("7i. Venue gate — activity-only policy blocks as it always has") {
       InviteDistribution{DistributionType::FIXED, 1.0, 0.5, 1}, 1.0, 1.0);
 
   PolicyManager pm(tw.world);
-  auto disease =
-      addVenueGatedPolicy(pm, tw.world, {"leisure"}, {}, 0.0, 10.0);
+  auto disease = addVenueGatedPolicy(pm, tw.world, {"leisure"}, {}, 0.0, 10.0);
 
   tw.world.people[0].applicable_temporal_policy_mask = 1;
   tw.world.people[1].applicable_temporal_policy_mask = 1;
@@ -2195,7 +2236,8 @@ TEST_CASE("7i. Venue gate — activity-only policy blocks as it always has") {
   CHECK(injected.empty());
 }
 
-TEST_CASE("7j. Venue gate — a virtual encounter is at no venue, so never gated") {
+TEST_CASE(
+    "7j. Venue gate — a virtual encounter is at no venue, so never gated") {
   /**
    * SCENARIO:
    *   CoordinatedEncounter::venue_type_id is polysemous: a world venue-type id
@@ -2222,8 +2264,8 @@ TEST_CASE("7j. Venue gate — a virtual encounter is at no venue, so never gated
           tw.world.getVenueTypeIndex("pub"));
 
   PolicyManager pm(tw.world);
-  auto disease = addVenueGatedPolicy(pm, tw.world, {"leisure"}, {"pub"}, 0.0,
-                                     10.0);
+  auto disease =
+      addVenueGatedPolicy(pm, tw.world, {"leisure"}, {"pub"}, 0.0, 10.0);
 
   tw.world.people[0].applicable_temporal_policy_mask = 1;
   tw.world.people[1].applicable_temporal_policy_mask = 1;
@@ -2259,8 +2301,8 @@ TEST_CASE("7k. Venue gate — a physical encounter gates on its own venue type")
       InviteDistribution{DistributionType::FIXED, 1.0, 0.5, 1}, 1.0, 1.0);
 
   PolicyManager pm(tw.world);
-  auto disease = addVenueGatedPolicy(pm, tw.world, {"leisure"}, {"pub"}, 0.0,
-                                     10.0);
+  auto disease =
+      addVenueGatedPolicy(pm, tw.world, {"leisure"}, {"pub"}, 0.0, 10.0);
 
   tw.world.people[0].applicable_temporal_policy_mask = 1;
   tw.world.people[1].applicable_temporal_policy_mask = 1;
@@ -2339,8 +2381,8 @@ TEST_CASE("7l. Eligibility asks the policy question and pins nobody") {
   pm.resolveAll(disease);
 
   Person& traveller = tw.world.people[1];
-  traveller.infection = std::make_unique<Infection>(&disease, 0.0, &traveller,
-                                                    42, nullptr, "household", 0);
+  traveller.infection = std::make_unique<Infection>(
+      &disease, 0.0, &traveller, 42, nullptr, "household", 0);
   traveller.applicable_symptom_policy_mask = 1;
   constexpr int16_t kHoppedSchedule = 3;
   constexpr int16_t kReturnSchedule = 1;
@@ -3392,8 +3434,8 @@ TEST_CASE("9c. Eligibility reads the instance, not the lookup tables") {
       InviteDistribution{DistributionType::FIXED, 1.0, 0.5, 1}, 1.0, 1.0);
 
   PolicyManager pm(tw.world);
-  auto disease = addVenueGatedPolicy(pm, tw.world, {"leisure"}, {"pub"}, 0.0,
-                                     10.0);
+  auto disease =
+      addVenueGatedPolicy(pm, tw.world, {"leisure"}, {"pub"}, 0.0, 10.0);
   tw.world.people[0].applicable_temporal_policy_mask = 1;
   tw.world.people[1].applicable_temporal_policy_mask = 1;
 
@@ -3436,8 +3478,8 @@ TEST_CASE("9d. A virtual encounter carrying an unresolvable type never gates") {
       InviteDistribution{DistributionType::FIXED, 1.0, 0.5, 1}, 1.0, 1.0);
 
   PolicyManager pm(tw.world);
-  auto disease = addVenueGatedPolicy(pm, tw.world, {"leisure"}, {"pub"}, 0.0,
-                                     10.0);
+  auto disease =
+      addVenueGatedPolicy(pm, tw.world, {"leisure"}, {"pub"}, 0.0, 10.0);
   tw.world.people[0].applicable_temporal_policy_mask = 1;
   tw.world.people[1].applicable_temporal_policy_mask = 1;
 

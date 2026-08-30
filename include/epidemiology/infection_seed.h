@@ -46,7 +46,7 @@ struct SeedTargetGroup {
 
   void resolve(const WorldState& world) {
     for (auto& c : criteria) {
-      c.resolve(world);
+      c.resolveOrThrow(world, "infection seed target group");
     }
   }
 };

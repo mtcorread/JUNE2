@@ -2,7 +2,11 @@
 #include "epidemiology/policy.h"
 
 #include "doctest.h"
+#include <fstream>
+
 #include "epidemiology/disease.h"
+#include "epidemiology/epidemiology.h"
+#include "loaders/policy_loader.h"
 #include "test_utils.h"
 
 using namespace june;
@@ -69,8 +73,8 @@ TemporalPolicy makeClosurePolicy(
     VenueGateDirection direction = VenueGateDirection::RestrictTo) {
   TemporalPolicy policy;
   policy.name = "closure";
-  policy.start_time = 0.0;
-  policy.end_time = 10.0;
+  policy.window.start_time = 0.0;
+  policy.window.end_time = 10.0;
   policy.action.override_activities.insert(activities.begin(),
                                            activities.end());
   auto& gated_types = (direction == VenueGateDirection::ExemptFrom)
@@ -434,8 +438,8 @@ TEST_CASE("Venue gate - an ungated policy never pays for the lookup") {
 // Composition with the conjuncts either side of the gate
 // =============================================================================
 
-TEST_CASE("Venue gate - compliance latch is unaffected by the gate") {
-  // The gate sits after the compliance latch, so a slot the gate blocks must
+TEST_CASE("Venue gate - Sticky Compliance is unaffected by the gate") {
+  // The gate sits after Sticky Compliance, so a slot the gate blocks must
   // still leave the person's compliance decision exactly as an ungated policy
   // would, and that decision must stick across slots.
   constexpr int kNumPeople = 16;
@@ -572,9 +576,10 @@ constexpr int16_t kFreezeScheduleIdx = 0;
 constexpr int16_t kHoppedSchedule = 3;
 constexpr int16_t kReturnSchedule = 1;
 
-// Sick for two days, then healthy: a freeze can be established while the
-// symptom holds and released once it lifts.
-Disease buildTwoStageDisease() {
+// Sick for `sick_days`, then healthy: a freeze can be established while the
+// symptom holds and released once it lifts. A long illness leaves a window
+// edge, rather than recovery, as the only thing that can end a policy.
+Disease buildTwoStageDisease(double sick_days = 2.0) {
   TransmissionParams transmission;
   transmission.mode = InfectiousnessMode::STAGE_DRIVEN;
   auto curve = std::make_shared<ConstantCurve>(1.0);
@@ -586,8 +591,29 @@ Disease buildTwoStageDisease() {
   TrajectoryDefinition trajectory;
   trajectory.selection_key = "general";
   trajectory.severity = 1.0;
-  trajectory.stages.push_back({"sick", {"constant", {{"value", 2.0}}}});
+  trajectory.stages.push_back({"sick", {"constant", {{"value", sick_days}}}});
   trajectory.stages.push_back({"healthy", {"constant", {{"value", 100.0}}}});
+  return Disease("TestDisease", symptom_tags, stage_settings, {trajectory}, {},
+                 transmission);
+}
+
+// As above, but the trajectory ends in death rather than recovery.
+Disease buildFatalDisease() {
+  TransmissionParams transmission;
+  transmission.mode = InfectiousnessMode::STAGE_DRIVEN;
+  auto curve = std::make_shared<ConstantCurve>(1.0);
+  transmission.stage_curves["sick"] = curve;
+  transmission.symptom_id_curves = {nullptr, curve, nullptr};
+  std::vector<SymptomTag> symptom_tags = {
+      {"healthy", -1, 0}, {"sick", 1, 1}, {"dead", 2, 2}};
+  DiseaseStageSettings stage_settings;
+  stage_settings.recovered_stages = {"healthy"};
+  stage_settings.fatality_stages = {"dead"};
+  TrajectoryDefinition trajectory;
+  trajectory.selection_key = "general";
+  trajectory.severity = 1.0;
+  trajectory.stages.push_back({"sick", {"constant", {{"value", 2.0}}}});
+  trajectory.stages.push_back({"dead", {"constant", {{"value", 100.0}}}});
   return Disease("TestDisease", symptom_tags, stage_settings, {trajectory}, {},
                  transmission);
 }
@@ -808,4 +834,578 @@ TEST_CASE("Query and override agree on the venue gate") {
     CHECK(querySuppressed(policy_manager, person, kLeisure, 9999));
     CHECK_FALSE(querySuppressed(policy_manager, person, kPrimaryActivity, 9999));
   }
+}
+
+// =============================================================================
+// ActiveWindow — the shared date range.
+//
+// Half-open [start, end): end_time is the first moment the policy is NOT in
+// force. Mirrors the simulation's own window (simulator.cpp: `day <
+// total_days_`), so adjacent windows abut exactly with no overlapping slot.
+// =============================================================================
+
+TEST_CASE("ActiveWindow - half-open in both directions") {
+  ActiveWindow window{5.0, 10.0};
+
+  CHECK_FALSE(window.contains(4.99));
+  CHECK(window.contains(5.0));
+  CHECK(window.contains(9.99));
+  CHECK_FALSE(window.contains(10.0));
+}
+
+TEST_CASE("ActiveWindow - the no-end sentinel never closes") {
+  ActiveWindow window{5.0, -1.0};
+
+  CHECK_FALSE(window.contains(4.99));
+  CHECK(window.contains(5.0));
+  CHECK(window.contains(100000.0));
+}
+
+TEST_CASE("ActiveWindow - declaring nothing is in force for the whole run") {
+  ActiveWindow window;
+
+  CHECK(window.contains(0.0));
+  CHECK(window.contains(100000.0));
+}
+
+TEST_CASE("Temporal policy - the end bound is the first slot NOT in force") {
+  WorldState world = buildVenueGateWorld();
+  PolicyManager policy_manager(world);
+  TemporalPolicy close_leisure = makeClosurePolicy({"leisure"}, {});
+  close_leisure.window = ActiveWindow{5.0, 10.0};
+  close_leisure.resolve(world);
+  policy_manager.addTemporalPolicy(close_leisure);
+  Person& person = world.people[0];
+
+  auto fires_at = [&](double time) {
+    return policy_manager
+        .getOverride(person, kLeisure, kPubVenue, 0,
+                     SlotVenueType::fromVenue(kPubVenue), time, 0)
+        .has_value();
+  };
+
+  CHECK_FALSE(fires_at(4.99));
+  CHECK(fires_at(5.0));
+  CHECK(fires_at(9.99));
+  // 10.0 is the first slot of the day the policy is no longer in force, not
+  // the last slot of its final day.
+  CHECK_FALSE(fires_at(10.0));
+  CHECK_FALSE(fires_at(10.33));
+}
+
+// =============================================================================
+// Symptom policy windows
+//
+// A symptom policy carries the same ActiveWindow as a temporal one: outside it
+// the policy is not in force, however symptomatic the person is.
+// =============================================================================
+
+TEST_CASE("Symptom policy - a window bounds it as well as the symptom") {
+  WorldState world = buildVenueGateWorld();
+  Disease disease = buildTwoStageDisease(1000.0);
+  PolicyManager policy_manager(world);
+  SymptomPolicy stay_home = makeFreezePolicy();
+  stay_home.window = ActiveWindow{5.0, 10.0};
+  policy_manager.addSymptomPolicy(stay_home);
+  policy_manager.resolveAll(disease);
+
+  Person& person = makeSickPerson(world, disease);
+
+  auto fires_at = [&](double time) {
+    return policy_manager
+        .getOverride(person, kLeisure, kPubVenue, 0,
+                     SlotVenueType::known(kPubVenueType), time, 0)
+        .has_value();
+  };
+
+  // Sick throughout, so only the window moves the answer.
+  CHECK_FALSE(fires_at(4.99));
+  CHECK(fires_at(5.0));
+  CHECK(fires_at(9.99));
+  CHECK_FALSE(fires_at(10.0));
+}
+
+TEST_CASE("Symptom policy - the window closing thaws a still-sick person") {
+  WorldState world = buildVenueGateWorld();
+  Disease disease = buildTwoStageDisease(1000.0);
+  PolicyManager policy_manager(world);
+  SymptomPolicy stay_home = makeFreezePolicy();
+  stay_home.window = ActiveWindow{0.0, 10.0};
+  policy_manager.addSymptomPolicy(stay_home);
+  policy_manager.resolveAll(disease);
+
+  Person& person = makeSickHoppedPerson(world, disease);
+
+  // In window: pinned, and the compliance decision latched.
+  REQUIRE(policy_manager
+              .getOverride(person, kLeisure, kPubVenue, 0,
+                           SlotVenueType::known(kPubVenueType), 1.0, 0)
+              .has_value());
+  REQUIRE(policy_manager.getFrozenStates().count(person.id) == 1);
+  REQUIRE(person.schedule_hop.hopped_schedule_id == kFreezeScheduleIdx);
+  REQUIRE(person.symptom_policy_decisions == 1);
+
+  // Out of window, and still just as sick.
+  CHECK_FALSE(policy_manager
+                  .getOverride(person, kLeisure, kPubVenue, 0,
+                               SlotVenueType::known(kPubVenueType), 10.0, 0)
+                  .has_value());
+  CHECK(person.infection->getTrajectory().getCurrentSymptomId(10.0) == 1);
+
+  // The person is back on their own travel schedule, holding no decision.
+  CHECK(policy_manager.getFrozenStates().empty());
+  CHECK(person.schedule_hop.hopped_schedule_id == kHoppedSchedule);
+  CHECK(person.schedule_hop.return_schedule_id == kReturnSchedule);
+  CHECK(person.symptom_policy_decisions == 0);
+  CHECK(person.active_symptom_policy_participation == 0);
+}
+
+TEST_CASE("Symptom policy - a closing window is not symptom progression") {
+  // inherit_compliance models the person carrying a decision from one stage of
+  // their illness into the next. A window edge is a change of instruction, not
+  // of the person, so the follow-up policy inherits nothing.
+  //
+  // The follow-up is registered first so that it is evaluated before the
+  // policy that hands to it, and its own compliance rate is zero: the only
+  // thing that can leave it participating is the inheritance.
+  constexpr uint32_t kAftercareBit = 1u << 0;
+
+  auto addPolicies = [](WorldState& world, Disease& disease,
+                        PolicyManager& policy_manager) -> Person* {
+    SymptomPolicy aftercare = makeFreezePolicy({}, 0.0);
+    aftercare.name = "aftercare";
+    aftercare.trigger_symptoms = {"healthy"};
+    policy_manager.addSymptomPolicy(aftercare);
+
+    SymptomPolicy stay_home = makeFreezePolicy();
+    stay_home.name = "stay_home_when_sick";
+    stay_home.follow_up_policy_name = "aftercare";
+    stay_home.inherit_compliance = true;
+    stay_home.window = ActiveWindow{0.0, 10.0};
+    policy_manager.addSymptomPolicy(stay_home);
+
+    policy_manager.resolveAll(disease);
+    Person& person = makeSickPerson(world, disease);
+    person.applicable_symptom_policy_mask = 0b11;
+    return &person;
+  };
+
+  SUBCASE("the symptom lifting hands the decision on") {
+    WorldState world = buildVenueGateWorld();
+    Disease disease = buildTwoStageDisease(2.0);
+    PolicyManager policy_manager(world);
+    Person& person = *addPolicies(world, disease, policy_manager);
+
+    REQUIRE(policy_manager
+                .getOverride(person, kLeisure, kPubVenue, 0,
+                             SlotVenueType::known(kPubVenueType), 1.0, 0)
+                .has_value());
+
+    // Day 3: recovered, so the policy is untriggered but still in force.
+    policy_manager.getOverride(person, kLeisure, kPubVenue, 0,
+                               SlotVenueType::known(kPubVenueType), 3.0, 0);
+
+    CHECK((person.active_symptom_policy_participation & kAftercareBit) != 0);
+  }
+
+  SUBCASE("the window closing does not") {
+    WorldState world = buildVenueGateWorld();
+    Disease disease = buildTwoStageDisease(1000.0);
+    PolicyManager policy_manager(world);
+    Person& person = *addPolicies(world, disease, policy_manager);
+
+    REQUIRE(policy_manager
+                .getOverride(person, kLeisure, kPubVenue, 0,
+                             SlotVenueType::known(kPubVenueType), 1.0, 0)
+                .has_value());
+
+    // Day 10: out of window, and just as sick as on day 1.
+    policy_manager.getOverride(person, kLeisure, kPubVenue, 0,
+                               SlotVenueType::known(kPubVenueType), 10.0, 0);
+
+    CHECK((person.active_symptom_policy_participation & kAftercareBit) == 0);
+  }
+}
+
+TEST_CASE("Query and override agree on the symptom policy window") {
+  // The query answers the same sentence as the override — and, as ever, still
+  // writes nothing, so it cannot thaw a person on its own.
+  WorldState world = buildVenueGateWorld();
+  Disease disease = buildTwoStageDisease(1000.0);
+  PolicyManager policy_manager(world);
+  SymptomPolicy stay_home = makeFreezePolicy();
+  stay_home.window = ActiveWindow{5.0, 10.0};
+  policy_manager.addSymptomPolicy(stay_home);
+  policy_manager.resolveAll(disease);
+
+  Person& person = makeSickHoppedPerson(world, disease);
+
+  for (double time : {4.99, 5.0, 9.99, 10.0}) {
+    const bool suppressed = policy_manager.suppressesParticipation(
+        person, kLeisure, SlotVenueType::known(kPubVenueType), time);
+    CHECK(suppressed == policy_manager.getSymptomPolicies()[0].window.contains(
+                            time));
+  }
+
+  // Nothing was decided or frozen by the questions alone.
+  CHECK(person.symptom_policy_decisions == 0);
+  CHECK(person.active_symptom_policy_participation == 0);
+  CHECK(policy_manager.getFrozenStates().empty());
+  CHECK(person.schedule_hop.hopped_schedule_id == kHoppedSchedule);
+}
+
+// =============================================================================
+// Window loading — the same four keys, the same precedence, for every policy
+// kind that carries an ActiveWindow.
+// =============================================================================
+
+namespace {
+
+// Writes a one-policy policies.yaml and returns the loaded window.
+ActiveWindow loadTemporalWindow(const std::string& date_keys,
+                                const std::string& simulation_start_date) {
+  const std::string path = "/tmp/june_test_policy_window.yaml";
+  {
+    std::ofstream out(path);
+    out << "policies:\n"
+           "  temporal_policies:\n"
+           "    - name: \"lockdown\"\n"
+           "      override_activities: [\"leisure\"]\n"
+           "      replacement: \"residence\"\n"
+        << date_keys;
+  }
+
+  WorldState world = buildVenueGateWorld();
+  PolicyManager policy_manager(world);
+  PolicyLoader::loadPolicies(policy_manager, path, simulation_start_date);
+  std::remove(path.c_str());
+
+  REQUIRE(policy_manager.getTemporalPolicyCount() == 1);
+  return policy_manager.getTemporalPolicies()[0].window;
+}
+
+// Writes a one-policy policies.yaml and returns the loaded symptom window.
+ActiveWindow loadSymptomWindow(const std::string& date_keys,
+                               const std::string& simulation_start_date) {
+  const std::string path = "/tmp/june_test_symptom_window.yaml";
+  {
+    std::ofstream out(path);
+    out << "policies:\n"
+           "  symptom_policies:\n"
+           "    - name: \"stay_home_when_sick\"\n"
+           "      symptoms: [\"sick\"]\n"
+           "      override_activities: [\"leisure\"]\n"
+           "      replacement: \"residence\"\n"
+        << date_keys;
+  }
+
+  WorldState world = buildVenueGateWorld();
+  PolicyManager policy_manager(world);
+  PolicyLoader::loadPolicies(policy_manager, path, simulation_start_date);
+  std::remove(path.c_str());
+
+  REQUIRE(policy_manager.getSymptomPolicyCount() == 1);
+  return policy_manager.getSymptomPolicies()[0].window;
+}
+
+}  // namespace
+
+TEST_CASE("Window loading - a symptom policy reads the same four keys") {
+  SUBCASE("dates convert against the simulation start date") {
+    ActiveWindow window = loadSymptomWindow(
+        "      start_date: \"2020-03-12\"\n"
+        "      end_date: \"2020-05-11\"\n",
+        "2020-02-01");
+
+    CHECK(window.start_time == doctest::Approx(40.0));
+    CHECK(window.end_time == doctest::Approx(100.0));
+  }
+
+  SUBCASE("declaring neither is in force for the whole run") {
+    ActiveWindow window = loadSymptomWindow("", "2020-02-01");
+
+    CHECK(window.start_time == doctest::Approx(0.0));
+    CHECK(window.end_time == doctest::Approx(-1.0));
+  }
+}
+
+TEST_CASE("Window loading - dates convert against the simulation start date") {
+  ActiveWindow window = loadTemporalWindow(
+      "      start_date: \"2020-03-12\"\n"
+      "      end_date: \"2020-05-11\"\n",
+      "2020-02-01");
+
+  // February 2020 has 29 days, so 12 March is day 40.
+  CHECK(window.start_time == doctest::Approx(40.0));
+  CHECK(window.end_time == doctest::Approx(100.0));
+}
+
+TEST_CASE("Window loading - numeric keys are the fallback, not the winner") {
+  SUBCASE("used when the date keys are absent") {
+    ActiveWindow window = loadTemporalWindow(
+        "      start_time: 7.0\n"
+        "      end_time: 21.0\n",
+        "2020-02-01");
+
+    CHECK(window.start_time == doctest::Approx(7.0));
+    CHECK(window.end_time == doctest::Approx(21.0));
+  }
+
+  SUBCASE("ignored when the date keys are present") {
+    ActiveWindow window = loadTemporalWindow(
+        "      start_date: \"2020-03-12\"\n"
+        "      start_time: 7.0\n"
+        "      end_date: \"2020-05-11\"\n"
+        "      end_time: 21.0\n",
+        "2020-02-01");
+
+    CHECK(window.start_time == doctest::Approx(40.0));
+    CHECK(window.end_time == doctest::Approx(100.0));
+  }
+
+  SUBCASE("declaring neither is in force for the whole run") {
+    ActiveWindow window = loadTemporalWindow("", "2020-02-01");
+
+    CHECK(window.start_time == doctest::Approx(0.0));
+    CHECK(window.end_time == doctest::Approx(-1.0));
+  }
+}
+
+TEST_CASE("Adjacent symptom windows never both hold the same slot") {
+  // end_date: X and start_date: X abut exactly. Overlap would let a person be
+  // counted under two policies at once, which the compliance draw would then
+  // compound; the half-open bound is what rules that out.
+  const std::string path = "/tmp/june_test_adjacent_windows.yaml";
+  {
+    std::ofstream out(path);
+    out << "policies:\n"
+           "  symptom_policies:\n"
+           "    - name: \"first_instruction\"\n"
+           "      symptoms: [\"sick\"]\n"
+           "      override_activities: [\"leisure\"]\n"
+           "      replacement: \"residence\"\n"
+           "      end_date: \"2020-03-12\"\n"
+           "    - name: \"second_instruction\"\n"
+           "      symptoms: [\"sick\"]\n"
+           "      override_activities: [\"primary_activity\"]\n"
+           "      replacement: \"residence\"\n"
+           "      start_date: \"2020-03-12\"\n";
+  }
+
+  WorldState world = buildVenueGateWorld();
+  Disease disease = buildTwoStageDisease(1000.0);
+  PolicyManager policy_manager(world);
+  PolicyLoader::loadPolicies(policy_manager, path, "2020-02-01");
+  std::remove(path.c_str());
+  policy_manager.resolveAll(disease);
+
+  Person& person = makeSickPerson(world, disease);
+  person.applicable_symptom_policy_mask = 0b11;
+
+  auto fires_at = [&](int16_t activity_index, double time) {
+    return policy_manager
+        .getOverride(person, activity_index, kPubVenue, 0,
+                     SlotVenueType::known(kPubVenueType), time, 0)
+        .has_value();
+  };
+
+  // 12 March is day 40. Every slot of that day belongs to the second
+  // instruction alone.
+  for (double time : {40.0, 40.33, 40.67}) {
+    CHECK_FALSE(fires_at(kLeisure, time));
+    CHECK(fires_at(kPrimaryActivity, time));
+  }
+
+  // ...and the last slot of the day before belongs to the first alone.
+  CHECK(fires_at(kLeisure, 39.67));
+  CHECK_FALSE(fires_at(kPrimaryActivity, 39.67));
+}
+
+TEST_CASE("Successive symptom windows tighten to the new rate, not past it") {
+  // Two instructions in sequence: comply at 0.4, then at 0.8. Once the second
+  // window opens, 80% of the population is held. Had the first policy stayed
+  // in force, the two draws would compound to 1 - 0.6 * 0.2 = 88%.
+  constexpr int kNumPeople = 500;
+  WorldState world = buildVenueGateWorld(kNumPeople);
+  Disease disease = buildTwoStageDisease(1000.0);
+  PolicyManager policy_manager(world);
+
+  SymptomPolicy first_instruction = makeFreezePolicy({}, 0.4);
+  first_instruction.name = "first_instruction";
+  first_instruction.window = ActiveWindow{0.0, 10.0};
+  policy_manager.addSymptomPolicy(first_instruction);
+
+  SymptomPolicy second_instruction = makeFreezePolicy({}, 0.8);
+  second_instruction.name = "second_instruction";
+  second_instruction.window = ActiveWindow{10.0, -1.0};
+  policy_manager.addSymptomPolicy(second_instruction);
+
+  policy_manager.resolveAll(disease);
+
+  auto countHeld = [&](double time) {
+    int held = 0;
+    for (int i = 0; i < kNumPeople; ++i) {
+      Person& person = world.people[static_cast<size_t>(i)];
+      held += policy_manager
+                      .getOverride(person, kLeisure, kPubVenue, 0,
+                                   SlotVenueType::known(kPubVenueType), time, 0)
+                      .has_value()
+                  ? 1
+                  : 0;
+    }
+    return held;
+  };
+
+  for (int i = 0; i < kNumPeople; ++i) {
+    Person& person = makeSickPerson(world, disease, static_cast<size_t>(i));
+    person.applicable_symptom_policy_mask = 0b11;
+  }
+
+  // Day 5: the first instruction alone, and its decisions are now latched.
+  const double first_share = countHeld(5.0) / double(kNumPeople);
+  CHECK(first_share > 0.35);
+  CHECK(first_share < 0.45);
+
+  // Day 15: the second instruction alone. Well clear of 0.88.
+  const double second_share = countHeld(15.0) / double(kNumPeople);
+  CHECK(second_share > 0.75);
+  CHECK(second_share < 0.85);
+}
+
+// =============================================================================
+// Freeze release on recovery and death
+//
+// getOverride releases a freeze from the untriggered branch of the symptom
+// loop — a branch only reachable while the person still carries an Infection.
+// Recovery and death clear the Infection, so nobody was left to thaw them.
+// =============================================================================
+
+TEST_CASE("Recovery releases the freeze") {
+  WorldState world = buildVenueGateWorld();
+  Disease disease = buildTwoStageDisease();
+  PolicyManager policy_manager(world);
+  policy_manager.addSymptomPolicy(makeFreezePolicy());
+  policy_manager.resolveAll(disease);
+
+  Person& person = makeSickHoppedPerson(world, disease);
+
+  // Day 1: sick and travelling, so the policy pins them in place.
+  REQUIRE(policy_manager
+              .getOverride(person, kLeisure, kPubVenue, 0,
+                           SlotVenueType::known(kPubVenueType), 1.0, 0)
+              .has_value());
+  REQUIRE(policy_manager.getFrozenStates().count(person.id) == 1);
+  REQUIRE(person.schedule_hop.hopped_schedule_id == kFreezeScheduleIdx);
+
+  Epidemiology epidemiology(world, &disease);
+  epidemiology.setPolicyManager(&policy_manager);
+  epidemiology.trackInfection(person.id);
+
+  // Day 3: recovered. The Infection is gone, so no later policy evaluation can
+  // reach the release branch — recovery itself has to do it.
+  epidemiology.updateInfectionStates(3.0, {});
+  REQUIRE(person.infection == nullptr);
+
+  CHECK(policy_manager.getFrozenStates().empty());
+  CHECK(person.schedule_hop.hopped_schedule_id == kHoppedSchedule);
+  CHECK(person.schedule_hop.return_schedule_id == kReturnSchedule);
+  CHECK_FALSE(policy_manager.suppressesParticipation(
+      person, kLeisure, SlotVenueType::known(kPubVenueType), 3.0));
+}
+
+TEST_CASE("Death releases the freeze") {
+  // A dead person never evaluates a policy again, so a freeze they die under
+  // would otherwise be written into every subsequent checkpoint.
+  WorldState world = buildVenueGateWorld();
+  Disease disease = buildFatalDisease();
+  PolicyManager policy_manager(world);
+  policy_manager.addSymptomPolicy(makeFreezePolicy());
+  policy_manager.resolveAll(disease);
+
+  Person& person = makeSickHoppedPerson(world, disease);
+
+  REQUIRE(policy_manager
+              .getOverride(person, kLeisure, kPubVenue, 0,
+                           SlotVenueType::known(kPubVenueType), 1.0, 0)
+              .has_value());
+  REQUIRE(policy_manager.getFrozenStates().count(person.id) == 1);
+
+  Epidemiology epidemiology(world, &disease);
+  epidemiology.setPolicyManager(&policy_manager);
+  epidemiology.trackInfection(person.id);
+
+  epidemiology.updateInfectionStates(3.0, {});
+  REQUIRE(person.is_dead);
+
+  CHECK(policy_manager.getFrozenStates().empty());
+}
+
+// =============================================================================
+// Policy count cap. The applicability masks are uint32_t, so a 33rd policy can
+// never fire — it must fail loud at resolve time rather than load silently.
+// =============================================================================
+
+TEST_CASE("A 33rd symptom policy is rejected by name") {
+  WorldState world = buildVenueGateWorld();
+  Disease disease = buildTwoStageDisease();
+  PolicyManager policy_manager(world);
+
+  for (int i = 0; i < 33; ++i) {
+    SymptomPolicy policy = makeFreezePolicy();
+    policy.name = "symptom_policy_" + std::to_string(i);
+    policy_manager.addSymptomPolicy(policy);
+  }
+
+  std::string message;
+  try {
+    policy_manager.resolveAll(disease);
+    FAIL("resolveAll accepted 33 symptom policies");
+  } catch (const std::runtime_error& error) {
+    message = error.what();
+  }
+  CHECK(message.find("symptom_policy_32") != std::string::npos);
+}
+
+TEST_CASE("A 33rd temporal policy is rejected by name") {
+  WorldState world = buildVenueGateWorld();
+  Disease disease = buildTwoStageDisease();
+  PolicyManager policy_manager(world);
+
+  for (int i = 0; i < 33; ++i) {
+    TemporalPolicy policy = makeClosurePolicy({"leisure"}, {"pub"});
+    policy.name = "temporal_policy_" + std::to_string(i);
+    policy_manager.addTemporalPolicy(policy);
+  }
+
+  std::string message;
+  try {
+    policy_manager.resolveAll(disease);
+    FAIL("resolveAll accepted 33 temporal policies");
+  } catch (const std::runtime_error& error) {
+    message = error.what();
+  }
+  CHECK(message.find("temporal_policy_32") != std::string::npos);
+}
+
+TEST_CASE("32 policies of each kind resolve and all can fire") {
+  WorldState world = buildVenueGateWorld();
+  Disease disease = buildTwoStageDisease();
+  PolicyManager policy_manager(world);
+
+  for (int i = 0; i < 32; ++i) {
+    SymptomPolicy symptom_policy = makeFreezePolicy();
+    symptom_policy.name = "symptom_policy_" + std::to_string(i);
+    policy_manager.addSymptomPolicy(symptom_policy);
+
+    TemporalPolicy temporal_policy = makeClosurePolicy({"leisure"}, {"pub"});
+    temporal_policy.name = "temporal_policy_" + std::to_string(i);
+    policy_manager.addTemporalPolicy(temporal_policy);
+  }
+
+  CHECK_NOTHROW(policy_manager.resolveAll(disease));
+
+  // The last of the 32 still reaches the top bit of the mask.
+  policy_manager.precomputePolicyApplicability(world.people);
+  CHECK(world.people[0].applicable_symptom_policy_mask == 0xFFFFFFFFu);
+  CHECK(world.people[0].applicable_temporal_policy_mask == 0xFFFFFFFFu);
 }

@@ -45,7 +45,8 @@ struct ActivityExemption {
     activity_index =
         static_cast<int16_t>(world.getActivityIndex(activity_name));
     for (auto& criterion : criteria) {
-      criterion.resolve(world);
+      criterion.resolveOrThrow(world, "policy exemption for activity '" +
+                                          activity_name + "'");
     }
   }
 };
@@ -336,11 +337,33 @@ struct PolicyAction {
 };
 
 // =============================================================================
+// ActiveWindow - the span of simulation time a policy is in force for
+// =============================================================================
+
+// Half-open [start_time, end_time): end_time is the first moment the policy is
+// NOT in force. This mirrors the simulation's own window (`day < total_days_`,
+// simulator.cpp), so an end_date of 2020-03-12 means "through 11 March" and
+// adjacent windows abut exactly, with no slot where both are active.
+struct ActiveWindow {
+  double start_time = 0.0;  // days from simulation start
+  double end_time = -1.0;   // -1 = no end
+
+  bool contains(double current_time) const {
+    if (current_time < start_time) return false;
+    if (end_time != -1.0 && current_time >= end_time) return false;
+    return true;
+  }
+};
+
+// =============================================================================
 // Symptom-Based Policy - Override behavior based on disease symptoms
 // =============================================================================
 
 struct SymptomPolicy {
   std::string name;
+
+  // Span of simulation time this policy is in force for
+  ActiveWindow window;
 
   // Symptoms that trigger this policy
   std::vector<std::string> trigger_symptoms;
@@ -391,7 +414,7 @@ struct SymptomPolicy {
 
   void resolve(const WorldState& world, const Disease& disease) {
     for (auto& crit : applies_to) {
-      crit.resolve(world);
+      crit.resolveOrThrow(world, "symptom policy '" + name + "' applies_to");
     }
 
     // Intern action
@@ -415,30 +438,14 @@ struct SymptomPolicy {
 struct TemporalPolicy {
   std::string name;
 
-  // Time range (in simulation time, days from start)
-  double start_time = 0.0;
-  double end_time = -1.0;  // -1 = no end
+  // Span of simulation time this policy is in force for
+  ActiveWindow window;
 
   // What to do
   PolicyAction action;
 
   // Optional: selection criteria (only apply to certain people)
   std::vector<SelectionCriterion> applies_to;
-
-  // Check if policy is active at given time
-  bool isActive(double current_time) const {
-    // Policy hasn't started yet
-    if (current_time < start_time) {
-      return false;
-    }
-    // Policy has ended (check if end_time is set, regardless of sign)
-    // -1.0 means no end time (policy runs indefinitely)
-    if (end_time != -1.0 && current_time > end_time) {
-      return false;
-    }
-    // Policy is active
-    return true;
-  }
 
   // Check if policy applies to this person (based on selection criteria)
   bool appliesTo(const Person& person,
@@ -459,7 +466,7 @@ struct TemporalPolicy {
 
   void resolve(const WorldState& world) {
     for (auto& crit : applies_to) {
-      crit.resolve(world);
+      crit.resolveOrThrow(world, "temporal policy '" + name + "' applies_to");
     }
     action.resolve(world, name);
   }
@@ -486,6 +493,9 @@ struct FrozenPersonState {
 
 class PolicyManager {
  public:
+  // Width of Person::applicable_symptom_policy_mask / _temporal_policy_mask.
+  static constexpr size_t kMaxPoliciesPerKind = 32;
+
   PolicyManager(WorldState& world);
 
   // Set base seed for deterministic RNG (MPI reproducibility)
@@ -546,6 +556,30 @@ class PolicyManager {
                                double current_time,
                                const Person* partner = nullptr) const;
 
+  // End a freeze, but only if this policy is the one that established it —
+  // another policy's freeze is not this policy's to lift.
+  void releaseFreeze(Person& person, size_t policy_index) {
+    auto frozen_it = frozen_states_.find(person.id);
+    if (frozen_it == frozen_states_.end()) return;
+    if (frozen_it->second.triggering_policy_index !=
+        static_cast<uint8_t>(policy_index)) {
+      return;
+    }
+    releaseAnyFreeze(person);
+  }
+
+  // End a freeze whichever policy established it, putting the person back on
+  // the travel schedule they were pinned off. A person nobody froze is left
+  // alone. The only place frozen_states_ entries are erased.
+  void releaseAnyFreeze(Person& person) {
+    auto frozen_it = frozen_states_.find(person.id);
+    if (frozen_it == frozen_states_.end()) return;
+    person.schedule_hop.restoreTargets(
+        frozen_it->second.paused_hopped_schedule_id,
+        frozen_it->second.paused_return_schedule_id);
+    frozen_states_.erase(frozen_it);
+  }
+
   // Clear all policies
   void clear() {
     symptom_policies_.clear();
@@ -562,6 +596,9 @@ class PolicyManager {
 
   // Resolve all policy criteria and intern activities/symptoms
   void resolveAll(const Disease& disease) {
+    rejectPoliciesBeyondMaskWidth(symptom_policies_, "symptom");
+    rejectPoliciesBeyondMaskWidth(temporal_policies_, "temporal");
+
     for (auto& p : symptom_policies_) p.resolve(world_, disease);
     for (auto& p : temporal_policies_) p.resolve(world_);
 
@@ -597,6 +634,19 @@ class PolicyManager {
       residence_act_idx_ =
           static_cast<int16_t>(world_.getActivityIndex("residence"));
     }
+  }
+
+  // Applicability is carried in a 32-bit mask per person, so a policy past the
+  // 32nd can never fire. Name the first such policy rather than drop it.
+  template <typename PolicyVector>
+  static void rejectPoliciesBeyondMaskWidth(const PolicyVector& policies,
+                                            const std::string& kind) {
+    if (policies.size() <= kMaxPoliciesPerKind) return;
+    throw std::runtime_error(
+        "PolicyManager: " + std::to_string(policies.size()) + " " + kind +
+        " policies exceeds the limit of " +
+        std::to_string(kMaxPoliciesPerKind) + "; '" +
+        policies[kMaxPoliciesPerKind].name + "' would never take effect");
   }
 
   // Helper: Apply compliance rate (returns true if person complies).

@@ -55,9 +55,18 @@ echo "  tmp:    $TMP"
 echo ""
 
 # --- config override for day count -------------------------------------------
+# Derived from the config's own start_date, so the harness follows the config's
+# calendar rather than pinning one of its own.
+START_DATE=$(sed -n 's/^[[:space:]]*start_date[[:space:]]*:[[:space:]]*"\([0-9-]*\)".*/\1/p' \
+  "${PROJECT_DIR}/${CONFIG}" | head -1)
+if [[ -z "$START_DATE" ]]; then
+  echo "FAIL: no start_date in ${CONFIG}"
+  exit 1
+fi
 END_DATE=$(python3 -c "
 from datetime import datetime, timedelta
-print((datetime(2024,1,1)+timedelta(days=${DAYS})).strftime('%Y-%m-%d'))
+start = datetime.strptime('${START_DATE}', '%Y-%m-%d')
+print((start + timedelta(days=${DAYS})).strftime('%Y-%m-%d'))
 ")
 cp "$CONFIG" "$TMP/simulation.yaml"
 if [[ "$(uname)" == "Darwin" ]]; then

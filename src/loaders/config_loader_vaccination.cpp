@@ -9,12 +9,13 @@
 
 #include "loaders/config_loader.h"
 #include "loaders/config_loader_detail.h"
+#include "utils/mpi_logging.h"
 
 namespace june {
 
 namespace {
 
-using ::june::config_detail::logRank0;
+using ::june::logRank0;
 using ::june::config_detail::parseSelectionCriteria;
 
 // Parse a vaccine efficacy node: either a flat `disease -> scalar` map

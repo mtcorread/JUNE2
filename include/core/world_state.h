@@ -9,6 +9,7 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "epidemiology/disease.h"
@@ -228,6 +229,12 @@ class WorldState {
   // Geographic index: geo_unit_id -> indices of people in this unit AND all its
   // descendants
   std::unordered_map<GeoUnitId, std::vector<uint32_t>> people_by_geo_unit;
+
+  // The units people are assigned to directly, i.e. the set of values of
+  // Person::geo_unit_id. A strict subset of people_by_geo_unit's keys, which
+  // also carry every ancestor of those units. Diagnostics that ask "would this
+  // exclude anybody?" want this one.
+  std::unordered_set<GeoUnitId> directly_inhabited_geo_units;
 
   // Build lookup indices (call after loading)
   void buildIndices();

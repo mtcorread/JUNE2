@@ -8,6 +8,7 @@
 
 #include "core/config.h"
 #include "epidemiology/policy.h"
+#include "loaders/selection_criterion_value.h"
 #include "utils/time_utils.h"
 
 namespace june {
@@ -27,9 +28,15 @@ class PolicyLoader {
   // Load a policy action
   static PolicyAction loadPolicyAction(const YAML::Node& node);
 
+  // Load the four date-range keys shared by every policy kind that carries an
+  // ActiveWindow: start_date > start_time > 0.0, end_date > end_time > no end.
+  static ActiveWindow loadActiveWindow(const YAML::Node& node,
+                                       const std::string& simulation_start_date);
+
   // Load symptom policies
   static void loadSymptomPolicies(PolicyManager& policy_manager,
-                                  const YAML::Node& node);
+                                  const YAML::Node& node,
+                                  const std::string& simulation_start_date);
 
   // Load temporal policies (lockdowns, etc.)
   static void loadTemporalPolicies(PolicyManager& policy_manager,
@@ -56,7 +63,8 @@ inline void PolicyLoader::loadPolicies(
 
     // Load symptom-based policies
     if (policies["symptom_policies"]) {
-      loadSymptomPolicies(policy_manager, policies["symptom_policies"]);
+      loadSymptomPolicies(policy_manager, policies["symptom_policies"],
+                          simulation_start_date);
     }
 
     // Load temporal policies
@@ -87,9 +95,8 @@ inline std::vector<SelectionCriterion> PolicyLoader::loadSelectionCriteria(
     // Parse value (can be int, float, string, or list)
     const auto& value_node = criterion_node["value"];
     if (value_node.IsSequence()) {
-      // List of ints
-      std::vector<int32_t> values = value_node.as<std::vector<int32_t>>();
-      criterion.value = values;
+      criterion.value = config_detail::parseCriterionSequenceValue(
+          value_node, criterion.property_path);
     } else if (value_node.IsScalar()) {
       // Try boolean first, then int, then float, then string
       std::string str_val = value_node.as<std::string>();
@@ -197,8 +204,37 @@ inline PolicyAction PolicyLoader::loadPolicyAction(const YAML::Node& node) {
   return action;
 }
 
-inline void PolicyLoader::loadSymptomPolicies(PolicyManager& policy_manager,
-                                              const YAML::Node& node) {
+inline ActiveWindow PolicyLoader::loadActiveWindow(
+    const YAML::Node& node, const std::string& simulation_start_date) {
+  ActiveWindow window;
+
+  // Start: a date wins over a raw offset; declaring neither starts immediately.
+  if (node["start_date"]) {
+    std::tm sim_start_tm = parseDate(simulation_start_date);
+    std::tm policy_start_tm = parseDate(node["start_date"].as<std::string>());
+    window.start_time =
+        static_cast<double>(daysBetween(sim_start_tm, policy_start_tm));
+  } else if (node["start_time"]) {
+    window.start_time = node["start_time"].as<double>();
+  }
+
+  // End: same precedence. The bound is half-open, so end_date names the first
+  // day the policy is NOT in force. Declaring neither leaves the -1 sentinel.
+  if (node["end_date"]) {
+    std::tm sim_start_tm = parseDate(simulation_start_date);
+    std::tm policy_end_tm = parseDate(node["end_date"].as<std::string>());
+    window.end_time =
+        static_cast<double>(daysBetween(sim_start_tm, policy_end_tm));
+  } else if (node["end_time"]) {
+    window.end_time = node["end_time"].as<double>();
+  }
+
+  return window;
+}
+
+inline void PolicyLoader::loadSymptomPolicies(
+    PolicyManager& policy_manager, const YAML::Node& node,
+    const std::string& simulation_start_date) {
   if (!node.IsSequence()) {
     throw std::runtime_error("symptom_policies must be a list");
   }
@@ -219,6 +255,8 @@ inline void PolicyLoader::loadSymptomPolicies(PolicyManager& policy_manager,
     }
     policy.trigger_symptoms =
         policy_node["symptoms"].as<std::vector<std::string>>();
+
+    policy.window = loadActiveWindow(policy_node, simulation_start_date);
 
     // Action
     policy.action = loadPolicyAction(policy_node);
@@ -260,31 +298,7 @@ inline void PolicyLoader::loadTemporalPolicies(
     }
     policy.name = policy_node["name"].as<std::string>();
 
-    // Start date/time
-    if (policy_node["start_date"]) {
-      std::string start_date = policy_node["start_date"].as<std::string>();
-      std::tm sim_start_tm = parseDate(simulation_start_date);
-      std::tm policy_start_tm = parseDate(start_date);
-      policy.start_time =
-          static_cast<double>(daysBetween(sim_start_tm, policy_start_tm));
-    } else if (policy_node["start_time"]) {
-      policy.start_time = policy_node["start_time"].as<double>();
-    } else {
-      policy.start_time = 0.0;  // Start immediately
-    }
-
-    // End date/time
-    if (policy_node["end_date"]) {
-      std::string end_date = policy_node["end_date"].as<std::string>();
-      std::tm sim_start_tm = parseDate(simulation_start_date);
-      std::tm policy_end_tm = parseDate(end_date);
-      policy.end_time =
-          static_cast<double>(daysBetween(sim_start_tm, policy_end_tm));
-    } else if (policy_node["end_time"]) {
-      policy.end_time = policy_node["end_time"].as<double>();
-    } else {
-      policy.end_time = -1.0;  // No end
-    }
+    policy.window = loadActiveWindow(policy_node, simulation_start_date);
 
     // Action
     policy.action = loadPolicyAction(policy_node);

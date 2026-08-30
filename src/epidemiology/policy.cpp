@@ -82,6 +82,16 @@ std::optional<PersonLocation> PolicyManager::getOverride(
 
       const auto& policy = symptom_policies_[i];
 
+      // Out of window: the policy is not in force, so it holds nobody. A
+      // calendar edge is a change of government instruction, not a change in
+      // the person, so no follow-up policy inherits the decision.
+      if (!policy.window.contains(current_time)) {
+        releaseFreeze(person, i);
+        person.active_symptom_policy_participation &= ~(1u << i);
+        person.symptom_policy_decisions &= ~(1u << i);
+        continue;
+      }
+
       bool is_triggered = policy.triggeredBy(current_symptom_id);
 
       // STICKY COMPLIANCE: if not triggered, clear participation/decision and
@@ -111,15 +121,7 @@ std::optional<PersonLocation> PolicyManager::getOverride(
         }
 
         // Restore paused hop state if this policy was responsible for freezing
-        auto frozen_it = frozen_states_.find(person.id);
-        if (frozen_it != frozen_states_.end() &&
-            frozen_it->second.triggering_policy_index ==
-                static_cast<uint8_t>(i)) {
-          person.schedule_hop.restoreTargets(
-              frozen_it->second.paused_hopped_schedule_id,
-              frozen_it->second.paused_return_schedule_id);
-          frozen_states_.erase(frozen_it);
-        }
+        releaseFreeze(person, i);
 
         person.active_symptom_policy_participation &= ~(1u << i);
         person.symptom_policy_decisions &= ~(1u << i);
@@ -207,7 +209,7 @@ std::optional<PersonLocation> PolicyManager::getOverride(
 
     const auto& policy = temporal_policies_[i];
 
-    bool is_active = policy.isActive(current_time);
+    bool is_active = policy.window.contains(current_time);
 
     if (!is_active) {
       person.active_temporal_policy_participation &= ~(1u << i);
@@ -276,6 +278,7 @@ bool PolicyManager::suppressesParticipation(
       if (!(symptom_mask & (1u << i))) continue;
 
       const auto& policy = symptom_policies_[i];
+      if (!policy.window.contains(current_time)) continue;
       if (!policy.triggeredBy(current_symptom_id)) continue;
 
       if (!isParticipating(person.symptom_policy_decisions,
@@ -298,7 +301,7 @@ bool PolicyManager::suppressesParticipation(
     if (!(temporal_mask & (1u << i))) continue;
 
     const auto& policy = temporal_policies_[i];
-    if (!policy.isActive(current_time)) continue;
+    if (!policy.window.contains(current_time)) continue;
 
     if (!isParticipating(person.temporal_policy_decisions,
                          person.active_temporal_policy_participation, i,
@@ -323,16 +326,16 @@ void PolicyManager::precomputePolicyApplicability(std::vector<Person>& people) {
     person.applicable_symptom_policy_mask = 0;
     person.applicable_temporal_policy_mask = 0;
 
-    for (size_t i = 0; i < std::min(symptom_policies_.size(), size_t(32));
-         ++i) {
+    for (size_t i = 0;
+         i < std::min(symptom_policies_.size(), kMaxPoliciesPerKind); ++i) {
       const auto& policy = symptom_policies_[i];
       if (policy.appliesTo(person, &world_)) {
         person.applicable_symptom_policy_mask |= (1u << i);
       }
     }
 
-    for (size_t i = 0; i < std::min(temporal_policies_.size(), size_t(32));
-         ++i) {
+    for (size_t i = 0;
+         i < std::min(temporal_policies_.size(), kMaxPoliciesPerKind); ++i) {
       const auto& policy = temporal_policies_[i];
       if (policy.appliesTo(person, &world_)) {
         person.applicable_temporal_policy_mask |= (1u << i);

@@ -497,6 +497,9 @@ Simulator::Simulator(WorldState& world, Config& config,
   // Set policy manager in activity manager
   activity_manager_.setPolicyManager(policy_manager_.get());
 
+  // Recovery and death end any policy freeze the person is under
+  epidemiology_->setPolicyManager(policy_manager_.get());
+
   // Precompute which policies apply to each person (based on selection
   // criteria) This must be done AFTER schedules are assigned (person properties
   // are set)

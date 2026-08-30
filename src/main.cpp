@@ -66,7 +66,9 @@ void printExamplePeople(const WorldState& world, size_t count = 5) {
                 using T = std::decay_t<decltype(arg)>;
                 if constexpr (std::is_same_v<T, std::monostate>) {
                   std::cout << "null";
-                } else if constexpr (std::is_same_v<T, std::vector<int32_t>>) {
+                } else if constexpr (std::is_same_v<T, std::vector<int32_t>> ||
+                                     std::is_same_v<T,
+                                                    std::vector<std::string>>) {
                   std::cout << "[" << arg.size() << " items]";
                 } else {
                   std::cout << arg;

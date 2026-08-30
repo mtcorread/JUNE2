@@ -587,8 +587,8 @@ void addClosurePolicy(PolicyManager& policy_manager, WorldState& world,
                       const std::vector<std::string>& venue_types) {
   TemporalPolicy policy;
   policy.name = "close_pubs";
-  policy.start_time = 0.0;
-  policy.end_time = 10.0;
+  policy.window.start_time = 0.0;
+  policy.window.end_time = 10.0;
   policy.action.override_activities.insert(activities.begin(),
                                            activities.end());
   policy.action.override_venue_types.insert(venue_types.begin(),
